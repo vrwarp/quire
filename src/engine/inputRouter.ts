@@ -12,9 +12,93 @@ import type { StrokePoint } from '../types';
  *   cooldown guard window so wrist touches never trigger accidental taps or pan jumps.
  */
 
+import { pointToSegmentDistSq } from './inkMath';
+
 export interface UnpackedStylusBatch {
   coalesced: Array<{ point: StrokePoint; exactTimeMs: number }>;
   predicted: StrokePoint[];
+  maxRawTimeStamp: number;
+}
+
+/**
+ * Strips overlapping historical `coalescedTouchesForTouch` windows concatenated by WebKit's
+ * `EventDispatcher::touchEvent` (`EventDispatcher.cpp:255`), which otherwise jump backward
+ * onto an already-recorded curve segment and create a straight-chord "double line" lens.
+ */
+export function filterCoalescedReplayPoints<T extends { point: StrokePoint }>(
+  candidates: T[],
+  committedPoints: StrokePoint[]
+): T[] {
+  if (candidates.length === 0 || committedPoints.length < 4) {
+    return candidates;
+  }
+
+  const out: T[] = [];
+  let prev = committedPoints[committedPoints.length - 1];
+  const prev2 = committedPoints[committedPoints.length - 2];
+  let dirX = prev.x - prev2.x;
+  let dirY = prev.y - prev2.y;
+  let dirLen = Math.hypot(dirX, dirY);
+  if (dirLen > 1e-4) {
+    dirX /= dirLen;
+    dirY /= dirLen;
+  }
+
+  const recentStart = Math.max(0, committedPoints.length - 120);
+  let skippingReplay = false;
+
+  const isOnCommittedWake = (x: number, y: number, endExclusive: number): boolean => {
+    for (let i = recentStart; i < endExclusive - 1; i++) {
+      const a = committedPoints[i];
+      const b = committedPoints[i + 1];
+      if (pointToSegmentDistSq(x, y, a.x, a.y, b.x, b.y) <= 25.0) {
+        // Within 5.0 pt of the already-recorded stroke ribbon
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const item = candidates[idx];
+    const p = item.point;
+    const stepX = p.x - prev.x;
+    const stepY = p.y - prev.y;
+    const stepDist = Math.hypot(stepX, stepY);
+
+    if (skippingReplay) {
+      if (stepDist < 0.15) {
+        continue;
+      }
+      const forwardProj = stepX * dirX + stepY * dirY;
+      // Stay in skippingReplay while re-tracing the already-committed wake behind `prev`;
+      // resume immediately once a sample advances forward past the tip!
+      if (forwardProj > 0.2 && !isOnCommittedWake(p.x, p.y, committedPoints.length)) {
+        skippingReplay = false;
+      } else if (isOnCommittedWake(p.x, p.y, committedPoints.length)) {
+        continue;
+      } else {
+        skippingReplay = false;
+      }
+    } else if (stepDist > 10.0 && dirLen > 1e-4) {
+      const dot = (stepX / stepDist) * dirX + (stepY / stepDist) * dirY;
+      // Abrupt >10 pt backward jump directly onto our own recent wake = WebKit coalesced overlap!
+      if (dot < -0.35 && isOnCommittedWake(p.x, p.y, committedPoints.length - 1)) {
+        skippingReplay = true;
+        continue;
+      }
+    }
+
+    out.push(item);
+    if (stepDist > 0.25) {
+      dirX = stepX / stepDist;
+      dirY = stepY / stepDist;
+      dirLen = 1;
+    }
+    prev = p;
+  }
+
+  return out;
 }
 
 export class PalmRejectionGuard {
@@ -46,16 +130,41 @@ export function unpackPointerSamples(
   e: PointerEvent,
   toPageCoords: (clientX: number, clientY: number) => { x: number; y: number },
   strokeStartPerf: number,
-  lastBatchPerf: number
+  lastBatchPerf: number,
+  lastRawTimeStamp = 0,
+  committedPoints: StrokePoint[] = []
 ): UnpackedStylusBatch {
   const rawCoalesced =
     typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
-  const coalescedList = rawCoalesced && rawCoalesced.length > 0 ? rawCoalesced : [e];
+  const rawList = rawCoalesced && rawCoalesced.length > 0 ? rawCoalesced : [e];
+
+  // 1. Filter out non-monotonic or stale historical coalesced events from previous batches
+  const monotonicList: PointerEvent[] = [];
+  let maxSeenRawTs = lastRawTimeStamp;
+  for (let i = 0; i < rawList.length; i++) {
+    const pe = rawList[i];
+    const ts = pe.timeStamp || 0;
+    if (ts > 0) {
+      // Strictly older than previous batch or older than an earlier sub-event in this batch -> stale replay!
+      if (lastRawTimeStamp > 0 && ts < lastRawTimeStamp - 0.05) {
+        continue;
+      }
+      if (ts < maxSeenRawTs - 0.05) {
+        continue;
+      }
+      if (ts > maxSeenRawTs) {
+        maxSeenRawTs = ts;
+      }
+    }
+    monotonicList.push(pe);
+  }
+  const coalescedList = monotonicList.length > 0 ? monotonicList : [e];
 
   const rawPredicted =
     typeof e.getPredictedEvents === 'function' ? e.getPredictedEvents() : [];
 
   const nowPerf = e.timeStamp || performance.now();
+  if (nowPerf > maxSeenRawTs) maxSeenRawTs = nowPerf;
   const spanMs = Math.max(4.0, Math.min(24.0, nowPerf - lastBatchPerf));
   const count = coalescedList.length;
 
@@ -81,9 +190,7 @@ export function unpackPointerSamples(
           return pe.timeStamp - prevT > 1.5;
         });
 
-  const coalesced = coalescedList.map((pe, idx) => {
-    // Spread 240 Hz coalesced sub-samples smoothly across the frame interval when WebKit
-    // rounds or duplicates pe.timeStamp across coalesced events.
+  const mappedCoalesced = coalescedList.map((pe, idx) => {
     const interpolatedTime = nowPerf - spanMs * ((count - 1 - idx) / count);
     const exactTimeMs = hasDistinctSubframeTimestamps ? pe.timeStamp : interpolatedTime;
     return {
@@ -92,12 +199,14 @@ export function unpackPointerSamples(
     };
   });
 
+  const coalesced = filterCoalescedReplayPoints(mappedCoalesced, committedPoints);
+
   const predicted = rawPredicted.slice(0, 3).map((pe, idx) => {
     const predTime = nowPerf + (idx + 1) * 4.167;
     return mapPoint(pe, predTime);
   });
 
-  return { coalesced, predicted };
+  return { coalesced, predicted, maxRawTimeStamp: maxSeenRawTs };
 }
 
 /**

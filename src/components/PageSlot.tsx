@@ -160,11 +160,11 @@ export function PageSlot({
     };
   }, [isVisible, images]);
 
-  // Suppress iPadOS Scribble on stylus touchstart while preserving finger pan/zoom
+  // Suppress iPadOS Scribble & UIScrollView gesture delay on Apple Pencil while preserving finger pan/zoom
   useEffect(() => {
     const el = slotRef.current;
     if (!el) return;
-    const onTouchStart = (e: TouchEvent) => {
+    const shouldClaimTouch = (e: TouchEvent) => {
       for (let i = 0; i < e.changedTouches.length; i++) {
         const touch = e.changedTouches[i] as Touch & { touchType?: string };
         if (touch.touchType === 'stylus' || (fingerDrawMode && activeTool !== 'pan' && activeTool !== 'text')) {
@@ -173,8 +173,12 @@ export function PageSlot({
         }
       }
     };
-    el.addEventListener('touchstart', onTouchStart, { passive: false });
-    return () => el.removeEventListener('touchstart', onTouchStart);
+    el.addEventListener('touchstart', shouldClaimTouch, { passive: false });
+    el.addEventListener('touchmove', shouldClaimTouch, { passive: false });
+    return () => {
+      el.removeEventListener('touchstart', shouldClaimTouch);
+      el.removeEventListener('touchmove', shouldClaimTouch);
+    };
   }, [activeTool, fingerDrawMode]);
 
   const drawingActive = activeTool !== 'pan' && activeTool !== 'text' && fingerDrawMode;

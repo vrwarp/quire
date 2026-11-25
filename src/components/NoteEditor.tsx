@@ -178,6 +178,7 @@ export function NoteEditor({
     points: StrokePoint[];
     startPerf: number;
     lastBatchPerf: number;
+    lastRawTimeStamp: number;
     audioSessionId?: string;
     startAudioMs?: number;
     dwellTimer: number;
@@ -198,7 +199,7 @@ export function NoteEditor({
     const ctx = fallbackWetCtxRef.current;
     const canvas = wetCanvasRef.current;
     if (!ctx || !canvas) return;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
     if (msg.type === 'clear') {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
     } else if (msg.type === 'wet-start' || msg.type === 'wet-append' || msg.type === 'wet-replace') {
@@ -220,7 +221,7 @@ export function NoteEditor({
     }
   }, []);
 
-  // 1. Mount ProMotion 120 Hz Governor + WebGL2 OffscreenCanvas InkRenderWorker + 120 Hz Scroll Bus
+  // 1. Mount ProMotion 120 Hz Governor + O(1) Dirty-Rect 2D OffscreenCanvas Worker + 120 Hz Scroll Bus
   useEffect(() => {
     const wrapper = stageWrapperRef.current;
     const scroller = scrollerRef.current;
@@ -228,8 +229,8 @@ export function NoteEditor({
     if (!wrapper || !scroller || !wetCanvas) return;
 
     const governor = new ProMotionGovernor(wrapper, {
-      holdMs: 15_000,
-      pacerPeriodMs: 120,
+      holdMs: 4_000,
+      pacerPeriodMs: 250,
       onStatusChange: (active) =>
         setTelemetry((prev) => ({
           ...prev,
@@ -238,7 +239,7 @@ export function NoteEditor({
         })),
     });
     governorRef.current = governor;
-    // Immediately pre-warm 120 Hz ProMotion when NoteEditor mounts so first Pencil stroke has 0ms PLL ramp lag!
+    // Pre-warm 120 Hz ProMotion when NoteEditor mounts so first Pencil stroke has 0ms PLL ramp lag
     governor.wake();
 
     const onVisibility = () => {
@@ -250,7 +251,7 @@ export function NoteEditor({
     };
     document.addEventListener('visibilitychange', onVisibility);
 
-    const dpr = Math.min(2.5, window.devicePixelRatio || 1);
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
     const rect = wrapper.getBoundingClientRect();
 
     // Transfer wet canvas to Dedicated OffscreenCanvas Worker (120 Hz AsyncSetLayerContents path)
@@ -297,7 +298,7 @@ export function NoteEditor({
 
     const resizeObs = new ResizeObserver(() => {
       const r = wrapper.getBoundingClientRect();
-      const curDpr = Math.min(2.5, window.devicePixelRatio || 1);
+      const curDpr = Math.min(2, window.devicePixelRatio || 1);
       if (workerRef.current) {
         workerRef.current.postMessage({ type: 'resize', width: r.width, height: r.height, dpr: curDpr });
       } else {
@@ -312,6 +313,7 @@ export function NoteEditor({
       read: () => ({ left: scroller.scrollLeft, top: scroller.scrollTop }),
       onReading: () => {
         governor.wake();
+        if (activeStrokeRef.current) return;
         const slots = scroller.querySelectorAll<HTMLElement>('[data-page-index]');
         const scrollerRect = scroller.getBoundingClientRect();
         const midY = scrollerRect.top + scrollerRect.height * 0.45;
@@ -525,7 +527,15 @@ export function NoteEditor({
 
     if (e.pointerType === 'pen') {
       palmGuardRef.current.notePenDown();
-    } else if (palmGuardRef.current.shouldRejectTouch(e)) {
+      // If a resting palm touched down moments before the Apple Pencil nib, preempt it immediately!
+      if (activeStrokeRef.current && activeStrokeRef.current.pointerType !== 'pen') {
+        window.clearTimeout(activeStrokeRef.current.dwellTimer);
+        activeStrokeRef.current = null;
+      }
+    } else if (
+      palmGuardRef.current.shouldRejectTouch(e) ||
+      (e.pointerType === 'touch' && (e.width > 28 || e.height > 28))
+    ) {
       return;
     }
 
@@ -595,6 +605,7 @@ export function NoteEditor({
     // Eraser tool (Whole-Stroke or Analytical Precision Partial Erase)
     if (effectiveTool === 'eraser') {
       applyEraserAt(page.pageId, xPt, yPt);
+      const nowPerf = e.timeStamp || performance.now();
       activeStrokeRef.current = {
         pointerId: e.pointerId,
         pointerType: e.pointerType,
@@ -609,8 +620,9 @@ export function NoteEditor({
         width: 14,
         paperTheme: 'light',
         points: [],
-        startPerf: e.timeStamp || performance.now(),
-        lastBatchPerf: e.timeStamp || performance.now(),
+        startPerf: nowPerf,
+        lastBatchPerf: nowPerf,
+        lastRawTimeStamp: e.timeStamp || 0,
         dwellTimer: 0,
       };
       return;
@@ -685,6 +697,7 @@ export function NoteEditor({
       points: [firstPt],
       startPerf,
       lastBatchPerf: startPerf,
+      lastRawTimeStamp: e.timeStamp || 0,
       audioSessionId,
       startAudioMs,
       dwellTimer: 0,
@@ -771,14 +784,21 @@ export function NoteEditor({
       return;
     }
 
-    // Unpack 240 Hz coalesced + UIKit predicted samples with de-quantized timestamps
-    const { coalesced, predicted: nativePredicted } = unpackPointerSamples(
+    // Unpack 240 Hz coalesced + UIKit predicted samples with overlap/backtrack deduplication
+    const {
+      coalesced,
+      predicted: nativePredicted,
+      maxRawTimeStamp,
+    } = unpackPointerSamples(
       e,
       toPageCoords,
       active.startPerf,
-      active.lastBatchPerf
+      active.lastBatchPerf,
+      active.lastRawTimeStamp,
+      active.points
     );
     active.lastBatchPerf = e.timeStamp || performance.now();
+    active.lastRawTimeStamp = maxRawTimeStamp;
 
     const isPen = active.pointerType === 'pen';
     const newPoints: StrokePoint[] = [];
@@ -809,10 +829,10 @@ export function NoteEditor({
       : predictorRef.current.predict(
           lastCommitted,
           nativePredicted,
-          settings.predictionLookaheadMs ?? 16
+          settings.predictionLookaheadMs ?? 12
         );
 
-    // Stream ONLY O(1) delta points + transient predicted tip to WebGL2 OffscreenCanvas worker!
+    // Stream ONLY O(1) delta points + transient predicted tip to 2D OffscreenCanvas worker!
     sendToWetWorker({
       type: 'wet-append',
       offsetX: active.offsetX,
@@ -967,16 +987,6 @@ export function NoteEditor({
       endAudioMs,
     };
 
-    if (active.tool === 'pen') {
-      sendToWetWorker({
-        type: 'wet-append',
-        offsetX: active.offsetX,
-        offsetY: active.offsetY,
-        zoom,
-        newPoints: [],
-        predicted: [],
-      });
-    }
     mutatePageStrokes(page.pageId, (prev) => [...prev, committed], 'Add stroke');
     window.requestAnimationFrame(() => {
       if (!activeStrokeRef.current) {
