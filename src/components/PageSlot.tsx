@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type {
   ImageItem,
   PageDescriptor,
@@ -109,8 +109,8 @@ export function PageSlot({
     };
   }, [isVisible, page.source, zoom]);
 
-  // Render Dry Highlighter + Dry Pen layers synchronously before paint so pen-up handoff never blinks
-  useLayoutEffect(() => {
+  // Render Dry Highlighter + Dry Pen layers whenever strokes or replay state change
+  useEffect(() => {
     if (!isVisible) return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const scale = zoom * dpr;
@@ -160,11 +160,11 @@ export function PageSlot({
     };
   }, [isVisible, images]);
 
-  // Suppress iPadOS Scribble & UIScrollView gesture delay on Apple Pencil while preserving finger pan/zoom
+  // Suppress iPadOS Scribble on stylus touchstart while keeping 120 Hz touchmove fully asynchronous
   useEffect(() => {
     const el = slotRef.current;
     if (!el) return;
-    const shouldClaimTouch = (e: TouchEvent) => {
+    const onTouchStart = (e: TouchEvent) => {
       for (let i = 0; i < e.changedTouches.length; i++) {
         const touch = e.changedTouches[i] as Touch & { touchType?: string };
         if (touch.touchType === 'stylus' || (fingerDrawMode && activeTool !== 'pan' && activeTool !== 'text')) {
@@ -173,12 +173,8 @@ export function PageSlot({
         }
       }
     };
-    el.addEventListener('touchstart', shouldClaimTouch, { passive: false });
-    el.addEventListener('touchmove', shouldClaimTouch, { passive: false });
-    return () => {
-      el.removeEventListener('touchstart', shouldClaimTouch);
-      el.removeEventListener('touchmove', shouldClaimTouch);
-    };
+    el.addEventListener('touchstart', onTouchStart, { passive: false });
+    return () => el.removeEventListener('touchstart', onTouchStart);
   }, [activeTool, fingerDrawMode]);
 
   const drawingActive = activeTool !== 'pan' && activeTool !== 'text' && fingerDrawMode;

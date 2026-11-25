@@ -33,7 +33,6 @@ import { NoteEditor } from './components/NoteEditor';
 import {
   ExportModal,
   PageManagerModal,
-  ProUpgradeModal,
   SettingsModal,
   WelcomeSheet,
 } from './components/Modals';
@@ -56,7 +55,6 @@ export function App() {
   const [pageManagerPageIdx, setPageManagerPageIdx] = useState<number | null>(null);
   const [exportPageIdx, setExportPageIdx] = useState<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [upgradeOpen, setUpgradeOpen] = useState(false);
   const [jumpToPageRequest, setJumpToPageRequest] = useState<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -132,12 +130,8 @@ export function App() {
     setSidebarCollapsed(true);
   };
 
-  // CUJ 1 & CUJ 7: One-tap + New Note (respects 5-note Free tier without locking existing notes)
+  // CUJ 1: One-tap + New Note (unlimited local-first notes)
   const handleCreateNote = () => {
-    if (!settings.pro.isPro && activeNotes.length >= settings.pro.freeNoteLimit) {
-      setUpgradeOpen(true);
-      return;
-    }
     const targetFolder = filter.kind === 'folder' ? filter.folderId : null;
     const fresh = createNewNote(settings, targetFolder);
     persistNote(fresh);
@@ -147,10 +141,6 @@ export function App() {
 
   // CUJ 3: Multi-Page PDF or .quire Bundle Import (with password-protected PDF support)
   const handleImportFile = async (file: File) => {
-    if (!settings.pro.isPro && activeNotes.length >= settings.pro.freeNoteLimit) {
-      setUpgradeOpen(true);
-      return;
-    }
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (file.name.toLowerCase().endsWith('.quire')) {
       try {
@@ -480,7 +470,6 @@ export function App() {
         collapsed={sidebarCollapsed}
         notes={notes}
         folders={folders}
-        settings={settings}
         filter={filter}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
@@ -500,7 +489,6 @@ export function App() {
           }
         }}
         onOpenSettings={() => setSettingsOpen(true)}
-        onOpenUpgrade={() => setUpgradeOpen(true)}
       />
 
       <main class="main-column">
@@ -732,42 +720,6 @@ export function App() {
             );
           }}
           onClose={() => setSettingsOpen(false)}
-          onOpenUpgrade={() => {
-            setSettingsOpen(false);
-            setUpgradeOpen(true);
-          }}
-        />
-      )}
-
-      {upgradeOpen && (
-        <ProUpgradeModal
-          onUnlockPro={() => {
-            updateSettings({
-              ...settings,
-              pro: {
-                ...settings.pro,
-                isPro: true,
-                purchasedAt: Date.now(),
-                receiptId: createId('quire_pro_v1'),
-              },
-            });
-            setUpgradeOpen(false);
-            showToast('Quire Pro unlocked forever! Unlimited notes & auto-backup enabled.');
-          }}
-          onRestorePro={() => {
-            updateSettings({
-              ...settings,
-              pro: {
-                ...settings.pro,
-                isPro: true,
-                purchasedAt: Date.now(),
-                receiptId: createId('quire_pro_restored'),
-              },
-            });
-            setUpgradeOpen(false);
-            showToast('Restored Quire Pro purchase.');
-          }}
-          onClose={() => setUpgradeOpen(false)}
         />
       )}
 

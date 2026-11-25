@@ -229,8 +229,7 @@ export function NoteEditor({
     if (!wrapper || !scroller || !wetCanvas) return;
 
     const governor = new ProMotionGovernor(wrapper, {
-      holdMs: 4_000,
-      pacerPeriodMs: 250,
+      holdMs: 850,
       onStatusChange: (active) =>
         setTelemetry((prev) => ({
           ...prev,
@@ -239,19 +238,8 @@ export function NoteEditor({
         })),
     });
     governorRef.current = governor;
-    // Pre-warm 120 Hz ProMotion when NoteEditor mounts so first Pencil stroke has 0ms PLL ramp lag
-    governor.wake();
 
-    const onVisibility = () => {
-      if (document.visibilityState === 'hidden') {
-        governor.park();
-      } else {
-        governor.wake();
-      }
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const dpr = Math.min(1.5, window.devicePixelRatio || 1);
     const rect = wrapper.getBoundingClientRect();
 
     // Transfer wet canvas to Dedicated OffscreenCanvas Worker (120 Hz AsyncSetLayerContents path)
@@ -298,7 +286,7 @@ export function NoteEditor({
 
     const resizeObs = new ResizeObserver(() => {
       const r = wrapper.getBoundingClientRect();
-      const curDpr = Math.min(2, window.devicePixelRatio || 1);
+      const curDpr = Math.min(1.5, window.devicePixelRatio || 1);
       if (workerRef.current) {
         workerRef.current.postMessage({ type: 'resize', width: r.width, height: r.height, dpr: curDpr });
       } else {
@@ -345,7 +333,6 @@ export function NoteEditor({
     });
 
     return () => {
-      document.removeEventListener('visibilitychange', onVisibility);
       detachMultiFinger();
       scroller.removeEventListener('scroll', onScroll);
       scroller.removeEventListener('touchstart', onScroll);
@@ -357,15 +344,6 @@ export function NoteEditor({
       governor.dispose();
     };
   }, []);
-
-  // Keep ProMotion 120 Hz warm when selecting ink tools; park in passive Read/Pan mode
-  useEffect(() => {
-    if (effectiveTool === 'pan') {
-      governorRef.current?.park();
-    } else {
-      governorRef.current?.wake();
-    }
-  }, [effectiveTool]);
 
   // Jump to requested page from Page Manager or PDF internal link
   useEffect(() => {
@@ -770,6 +748,7 @@ export function NoteEditor({
 
     const active = activeStrokeRef.current;
     if (!active || active.pointerId !== e.pointerId) return;
+    governorRef.current?.wake();
 
     // ZERO DOM reflows on the hot ink path: use cached pageLeft / pageTop from pointerdown!
     const toPageCoords = (cx: number, cy: number) => ({
@@ -811,7 +790,7 @@ export function NoteEditor({
       const fy = isPen ? raw.y : filterYRef.current.filter(raw.y, item.exactTimeMs);
       const prev = active.points[active.points.length - 1];
       const d = Math.hypot(fx - prev.x, fy - prev.y);
-      if (d >= 0.12) {
+      if (d >= 0.35) {
         movedDist += d;
         const accepted: StrokePoint = { ...raw, x: fx, y: fy };
         active.points.push(accepted);
@@ -829,7 +808,7 @@ export function NoteEditor({
       : predictorRef.current.predict(
           lastCommitted,
           nativePredicted,
-          settings.predictionLookaheadMs ?? 12
+          settings.predictionLookaheadMs ?? 10
         );
 
     // Stream ONLY O(1) delta points + transient predicted tip to 2D OffscreenCanvas worker!
@@ -988,11 +967,7 @@ export function NoteEditor({
     };
 
     mutatePageStrokes(page.pageId, (prev) => [...prev, committed], 'Add stroke');
-    window.requestAnimationFrame(() => {
-      if (!activeStrokeRef.current) {
-        sendToWetWorker({ type: 'clear' });
-      }
-    });
+    sendToWetWorker({ type: 'clear' });
   };
 
   const applyEraserAt = (pageId: string, xPt: number, yPt: number) => {

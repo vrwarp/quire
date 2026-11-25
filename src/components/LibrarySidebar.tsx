@@ -12,7 +12,7 @@ import {
   Star,
   Trash2,
 } from 'lucide-preact';
-import type { AppSettings, Folder, NoteDocument } from '../types';
+import type { Folder, NoteDocument } from '../types';
 import { getFolderDepth } from '../engine/storage';
 
 export type LibraryFilter =
@@ -27,7 +27,6 @@ interface LibrarySidebarProps {
   collapsed: boolean;
   notes: NoteDocument[];
   folders: Folder[];
-  settings: AppSettings;
   filter: LibraryFilter;
   searchQuery: string;
   onSearchChange: (q: string) => void;
@@ -38,7 +37,6 @@ interface LibrarySidebarProps {
   onDeleteFolder: (folderId: string) => void;
   onMoveNoteToFolder: (noteId: string, folderId: string | null) => void;
   onOpenSettings: () => void;
-  onOpenUpgrade: () => void;
 }
 
 const FOLDER_COLORS = ['#c85a32', '#2563eb', '#15803d', '#b45309', '#475569'];
@@ -47,7 +45,6 @@ export function LibrarySidebar({
   collapsed,
   notes,
   folders,
-  settings,
   filter,
   searchQuery,
   onSearchChange,
@@ -58,7 +55,6 @@ export function LibrarySidebar({
   onDeleteFolder,
   onMoveNoteToFolder,
   onOpenSettings,
-  onOpenUpgrade,
 }: LibrarySidebarProps) {
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderName, setFolderName] = useState('');
@@ -133,7 +129,6 @@ export function LibrarySidebar({
         <div class="brand-mark">
           <img src="./icon.svg" alt="" />
           <span>Quire</span>
-          {settings.pro.isPro && <span class="pro-chip">Pro</span>}
         </div>
         <button
           id="btn-open-settings"
@@ -349,19 +344,8 @@ export function LibrarySidebar({
 
       <div class="sidebar-footer">
         <span>
-          {settings.pro.isPro
-            ? 'Pro Unlocked · Unlimited'
-            : `${activeNotes.length} / ${settings.pro.freeNoteLimit} Free Notes`}
+          {activeNotes.length} {activeNotes.length === 1 ? 'Note' : 'Notes'} · Local-First
         </span>
-        {!settings.pro.isPro && (
-          <button
-            type="button"
-            style={{ color: 'var(--accent)', fontWeight: 600, fontSize: '12px' }}
-            onClick={onOpenUpgrade}
-          >
-            Unlock Pro
-          </button>
-        )}
       </div>
     </aside>
   );

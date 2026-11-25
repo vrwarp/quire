@@ -152,13 +152,6 @@ export interface SyncConfig {
   status: 'local-only' | 'syncing' | 'synced' | 'conflict' | 'offline';
 }
 
-export interface ProEntitlement {
-  isPro: boolean;
-  purchasedAt: number | null;
-  receiptId: string | null;
-  freeNoteLimit: number;
-}
-
 export interface AppSettings {
   hasCompletedOnboarding: boolean;
   defaultTemplate: PaperTemplate;
@@ -174,7 +167,6 @@ export interface AppSettings {
   highlighterColorPresets: string[];
   backup: BackupConfig;
   sync: SyncConfig;
-  pro: ProEntitlement;
 }
 
 export interface UndoCommand {

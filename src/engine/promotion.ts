@@ -38,8 +38,8 @@ export class ProMotionGovernor {
     }
   ) {
     this.host = host;
-    this.holdMs = options?.holdMs ?? 4_000;
-    this.pacerPeriodMs = options?.pacerPeriodMs ?? 250;
+    this.holdMs = options?.holdMs ?? 850;
+    this.pacerPeriodMs = options?.pacerPeriodMs ?? 180;
     this.onStatusChange = options?.onStatusChange;
 
     this.rateMark = document.createElement('span');
@@ -50,7 +50,7 @@ export class ProMotionGovernor {
     this.pacer.className = 'quire-display-pacer';
     this.pacer.setAttribute('aria-hidden', 'true');
     const pacerInner = document.createElement('div');
-    pacerInner.style.height = '400px';
+    pacerInner.style.height = '16px';
     pacerInner.style.width = '1px';
     this.pacer.appendChild(pacerInner);
 
@@ -120,7 +120,7 @@ export class ProMotionGovernor {
   private stepPacer(now: number): void {
     if (now - this.lastPacerAt < this.pacerPeriodMs) return;
     this.lastPacerAt = now;
-    const targetTop = this.pacerForward ? 200 : 0;
+    const targetTop = this.pacerForward ? 8 : 0;
     this.pacerForward = !this.pacerForward;
     try {
       this.pacer.scrollTo({
