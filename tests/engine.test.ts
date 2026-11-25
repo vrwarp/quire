@@ -3,6 +3,7 @@ import { PDFDocument } from 'pdf-lib';
 import { unzipSync, strFromU8 } from 'fflate';
 import {
   OneEuroFilter,
+  StylusKinematicPredictor,
   buildStrokeOutline,
   computeBBox,
   hitTestStroke,
@@ -11,6 +12,7 @@ import {
   recognizeShape,
   strokeInLasso,
 } from '../src/engine/inkMath';
+import { unpackPointerSamples } from '../src/engine/inputRouter';
 import {
   DEFAULT_SETTINGS,
   createId,
@@ -318,3 +320,90 @@ describe('ProMotion 120 Hz Governor (WebKit Bypass Primitives)', () => {
     host.remove();
   });
 });
+
+describe('Apple Pencil Low-Latency Pipeline (Kinematic Predictor & 240 Hz De-Quantizer)', () => {
+  it('synthesizes transient 16ms lookahead points even when WebKit Bug 284852 drops nativePredicted', () => {
+    const predictor = new StylusKinematicPredictor();
+    // Simulate steady 240 Hz stroke moving +4 pt every 4.167 ms (~960 pt/s)
+    const p0 = makePt(100, 200, 0, 0.65);
+    const p1 = makePt(104, 200, 4, 0.65);
+    const p2 = makePt(108, 200, 8, 0.65);
+    predictor.pushSample(p0, 1000.0);
+    predictor.pushSample(p1, 1004.167);
+    predictor.pushSample(p2, 1008.333);
+
+    const tip = predictor.predict(p2, [], 16);
+    expect(tip.length).toBe(3);
+    expect(tip[0].x).toBeGreaterThan(p2.x);
+    expect(tip[2].x).toBeGreaterThan(tip[0].x);
+    expect(tip[2].x - p2.x).toBeGreaterThan(10);
+    expect(tip[2].x - p2.x).toBeLessThanOrEqual(34);
+  });
+
+  it('attenuates lookahead on sharp high-curvature turns and suppresses jitter when stationary', () => {
+    const straight = new StylusKinematicPredictor();
+    straight.pushSample(makePt(0, 0, 0), 0);
+    straight.pushSample(makePt(6, 0, 4), 4);
+    const lastStraight = makePt(12, 0, 8);
+    straight.pushSample(lastStraight, 8);
+    const straightLead = Math.hypot(
+      straight.predict(lastStraight, [], 16)[2].x - lastStraight.x,
+      straight.predict(lastStraight, [], 16)[2].y - lastStraight.y
+    );
+
+    const corner = new StylusKinematicPredictor();
+    corner.pushSample(makePt(0, 0, 0), 0);
+    corner.pushSample(makePt(6, 0, 4), 4);
+    const lastCorner = makePt(6, 6, 8);
+    corner.pushSample(lastCorner, 8);
+    const cornerTip = corner.predict(lastCorner, [], 16);
+    const cornerLead = Math.hypot(
+      cornerTip[2].x - lastCorner.x,
+      cornerTip[2].y - lastCorner.y
+    );
+    expect(cornerLead).toBeLessThan(straightLead);
+
+    // Near-stationary hold (<35 pt/s) returns empty prediction so Hold-to-Snap never wobbles
+    const stationary = new StylusKinematicPredictor();
+    stationary.pushSample(makePt(50, 50, 0), 0);
+    stationary.pushSample(makePt(50.05, 50.02, 20), 20);
+    expect(stationary.predict(makePt(50.05, 50.02, 20), [], 16)).toEqual([]);
+  });
+
+  it('de-quantizes duplicate 1ms-rounded WebKit coalesced timestamps across 240 Hz sub-samples', () => {
+    const sub0 = {
+      clientX: 100,
+      clientY: 200,
+      pointerType: 'pen',
+      pressure: 0.6,
+      timeStamp: 1008,
+    } as unknown as PointerEvent;
+    const sub1 = {
+      clientX: 104,
+      clientY: 200,
+      pointerType: 'pen',
+      pressure: 0.7,
+      timeStamp: 1008,
+    } as unknown as PointerEvent;
+    const batchEvent = {
+      clientX: 104,
+      clientY: 200,
+      pointerType: 'pen',
+      pressure: 0.7,
+      timeStamp: 1008,
+      getCoalescedEvents: () => [sub0, sub1],
+      getPredictedEvents: () => [],
+    } as unknown as PointerEvent;
+
+    const unpacked = unpackPointerSamples(
+      batchEvent,
+      (cx, cy) => ({ x: cx, y: cy }),
+      1000,
+      1000
+    );
+    expect(unpacked.coalesced.length).toBe(2);
+    expect(unpacked.coalesced[0].exactTimeMs).toBeCloseTo(1004, 2);
+    expect(unpacked.coalesced[1].exactTimeMs).toBeCloseTo(1008, 2);
+  });
+});
+

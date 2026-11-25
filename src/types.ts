@@ -168,6 +168,7 @@ export interface AppSettings {
   toolbarDock: ToolbarDock;
   fingerDrawMode: boolean;
   scribbleEraseEnabled: boolean;
+  predictionLookaheadMs: number;
   audioPreRollMs: number;
   penColorPresets: string[];
   highlighterColorPresets: string[];

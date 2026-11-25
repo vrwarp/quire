@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type {
   ImageItem,
   PageDescriptor,
@@ -109,8 +109,8 @@ export function PageSlot({
     };
   }, [isVisible, page.source, zoom]);
 
-  // Render Dry Highlighter + Dry Pen layers whenever strokes or replay state change
-  useEffect(() => {
+  // Render Dry Highlighter + Dry Pen layers synchronously before paint so pen-up handoff never blinks
+  useLayoutEffect(() => {
     if (!isVisible) return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const scale = zoom * dpr;

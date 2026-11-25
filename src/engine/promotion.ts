@@ -3,14 +3,15 @@
  *
  * Implements the three-part WebKit ProMotion wake protocol:
  * 1. `.quire-rate-mark`: 1px GPU-composited transform animation registering an active CAAnimation.
- * 2. `.quire-display-pacer`: 8px hidden overflow:scroll container periodically smooth-scrolling
- *    to keep UIKit's scroll CADisplayLink in the CAFrameRateRange(80, 120, 120) band.
+ * 2. `.quire-display-pacer`: hidden overflow:scroll container continuously smooth-scrolling
+ *    across a 240px range every 120ms so UIKit's UIScrollView CADisplayLink NEVER drops out
+ *    of CAFrameRateRange(80, 120, 120) between words or strokes on M1/M2/M4 iPad Pro.
  * 3. Empty main-thread requestAnimationFrame loop: forces RemoteLayerTreeDrawingAreaProxy::didRefreshDisplay
  *    to call scrollingCoordinatorProxy->sendScrollingTreeNodeUpdate() unconditionally (bypassing
  *    m_waitingForDidScrollReply in RemoteScrollingCoordinatorProxy.cpp).
  *
- * Automatically parks after `holdMs` of inactivity so ProMotion drops back to idle refresh rates
- * to preserve battery.
+ * Holds 120 Hz warm for `holdMs` (default 15s while an ink tool is active) so starting a new word
+ * never suffers a 2–4 frame 60->120 Hz ProMotion PLL ramp-up delay, then parks cleanly on idle.
  */
 export class ProMotionGovernor {
   private host: HTMLElement;
@@ -21,7 +22,7 @@ export class ProMotionGovernor {
   private pinned = false;
   private rafId = 0;
   private holdTimer = 0;
-  private pacerForward = true;
+  private pacerStep = 0;
   private lastPacerAt = -Infinity;
   private lastVsync = 0;
   private readonly holdMs: number;
@@ -37,8 +38,8 @@ export class ProMotionGovernor {
     }
   ) {
     this.host = host;
-    this.holdMs = options?.holdMs ?? 800;
-    this.pacerPeriodMs = options?.pacerPeriodMs ?? 180;
+    this.holdMs = options?.holdMs ?? 15_000;
+    this.pacerPeriodMs = options?.pacerPeriodMs ?? 120;
     this.onStatusChange = options?.onStatusChange;
 
     this.rateMark = document.createElement('span');
@@ -49,7 +50,7 @@ export class ProMotionGovernor {
     this.pacer.className = 'quire-display-pacer';
     this.pacer.setAttribute('aria-hidden', 'true');
     const pacerInner = document.createElement('div');
-    pacerInner.style.height = '16px';
+    pacerInner.style.height = '320px';
     pacerInner.style.width = '1px';
     this.pacer.appendChild(pacerInner);
 
@@ -119,14 +120,16 @@ export class ProMotionGovernor {
   private stepPacer(now: number): void {
     if (now - this.lastPacerAt < this.pacerPeriodMs) return;
     this.lastPacerAt = now;
+    this.pacerStep = (this.pacerStep + 1) % 4;
+    const targets = [40, 220, 80, 260];
+    const targetTop = targets[this.pacerStep];
     try {
       this.pacer.scrollTo({
-        top: this.pacerForward ? 8 : 0,
+        top: targetTop,
         behavior: 'smooth',
       });
     } catch {
-      this.pacer.scrollTop = this.pacerForward ? 8 : 0;
+      this.pacer.scrollTop = targetTop;
     }
-    this.pacerForward = !this.pacerForward;
   }
 }
