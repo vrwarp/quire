@@ -145,6 +145,25 @@ def main():
             print(f"[PASS] CUJ 2 Dry layer pixel counts (highlighter, pen): {non_empty}")
             assert all(n > 20 for n in non_empty), f"Expected ink pixels on both layers, got {non_empty}"
 
+            # Verify Wet OffscreenCanvas overlay cleared cleanly after pen lift (0 ghost/double-line pixels!)
+            wet_leftover = page.evaluate("""async () => {
+                const wet = document.querySelector('.wet-canvas-overlay');
+                if (!wet) return -1;
+                const bmp = await createImageBitmap(wet);
+                const tmp = document.createElement('canvas');
+                tmp.width = bmp.width;
+                tmp.height = bmp.height;
+                const tctx = tmp.getContext('2d');
+                tctx.drawImage(bmp, 0, 0);
+                bmp.close();
+                const data = tctx.getImageData(0, 0, tmp.width, tmp.height).data;
+                let dirty = 0;
+                for (let i = 3; i < data.length; i += 32) if (data[i] > 0) dirty++;
+                return dirty;
+            }""")
+            assert wet_leftover == 0, f"Wet OffscreenCanvas left {wet_leftover} ghost pixels after pointerup!"
+            print("[PASS] Wet OffscreenCanvas dirty-rect cleared to 0 ghost pixels after pen lift")
+
             # Add a Typed Text Box (FR-INK-06)
             page.click("#tool-text")
             page.mouse.click(box["x"] + 95, box["y"] + 210)

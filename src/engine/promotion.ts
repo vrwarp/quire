@@ -22,7 +22,7 @@ export class ProMotionGovernor {
   private pinned = false;
   private rafId = 0;
   private holdTimer = 0;
-  private pacerStep = 0;
+  private pacerForward = true;
   private lastPacerAt = -Infinity;
   private lastVsync = 0;
   private readonly holdMs: number;
@@ -38,8 +38,8 @@ export class ProMotionGovernor {
     }
   ) {
     this.host = host;
-    this.holdMs = options?.holdMs ?? 15_000;
-    this.pacerPeriodMs = options?.pacerPeriodMs ?? 120;
+    this.holdMs = options?.holdMs ?? 4_000;
+    this.pacerPeriodMs = options?.pacerPeriodMs ?? 250;
     this.onStatusChange = options?.onStatusChange;
 
     this.rateMark = document.createElement('span');
@@ -50,7 +50,7 @@ export class ProMotionGovernor {
     this.pacer.className = 'quire-display-pacer';
     this.pacer.setAttribute('aria-hidden', 'true');
     const pacerInner = document.createElement('div');
-    pacerInner.style.height = '320px';
+    pacerInner.style.height = '400px';
     pacerInner.style.width = '1px';
     this.pacer.appendChild(pacerInner);
 
@@ -120,9 +120,8 @@ export class ProMotionGovernor {
   private stepPacer(now: number): void {
     if (now - this.lastPacerAt < this.pacerPeriodMs) return;
     this.lastPacerAt = now;
-    this.pacerStep = (this.pacerStep + 1) % 4;
-    const targets = [40, 220, 80, 260];
-    const targetTop = targets[this.pacerStep];
+    const targetTop = this.pacerForward ? 200 : 0;
+    this.pacerForward = !this.pacerForward;
     try {
       this.pacer.scrollTo({
         top: targetTop,

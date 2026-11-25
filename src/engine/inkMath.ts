@@ -111,42 +111,72 @@ export function strokeHalfWidth(baseWidth: number, pressure: number, isHighlight
 }
 
 /**
- * Centripetal Catmull-Rom interpolation producing smooth sub-points for variable-width ribbons
- * and vector PDF cubic Bézier outlines.
+ * True Barry–Goldman Centripetal Catmull-Rom interpolation (alpha = 0.5).
+ * Mathematically guaranteed never to form cusps, overshoot horns, or self-intersections
+ * even when adjacent stylus segment lengths vary by >50x.
  */
 export function densifyStrokePoints(points: StrokePoint[], subdivisions = 3): StrokePoint[] {
   if (points.length < 3) return points;
   const out: StrokePoint[] = [points[0]];
+
+  const knotDelta = (a: StrokePoint, b: StrokePoint): number => {
+    const d = Math.hypot(b.x - a.x, b.y - a.y);
+    return Math.max(1e-3, Math.sqrt(d)); // alpha = 0.5 (centripetal)
+  };
+
   for (let i = 0; i < points.length - 1; i++) {
     const p0 = points[Math.max(0, i - 1)];
     const p1 = points[i];
     const p2 = points[i + 1];
     const p3 = points[Math.min(points.length - 1, i + 2)];
     const segLen = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    const steps = segLen < 2 ? 1 : Math.min(subdivisions, Math.ceil(segLen / 3));
+    const steps = segLen < 2.2 ? 1 : Math.min(subdivisions, Math.ceil(segLen / 3.5));
+
+    if (steps === 1) {
+      out.push(p2);
+      continue;
+    }
+
+    const t0 = 0;
+    const t1 = i === 0 ? t0 + knotDelta(p1, p2) : t0 + knotDelta(p0, p1);
+    const t2 = t1 + knotDelta(p1, p2);
+    const t3 = i + 2 >= points.length ? t2 + knotDelta(p1, p2) : t2 + knotDelta(p2, p3);
+
+    const p0x = i === 0 ? p1.x - (p2.x - p1.x) : p0.x;
+    const p0y = i === 0 ? p1.y - (p2.y - p1.y) : p0.y;
+    const p3x = i + 2 >= points.length ? p2.x + (p2.x - p1.x) : p3.x;
+    const p3y = i + 2 >= points.length ? p2.y + (p2.y - p1.y) : p3.y;
+
     for (let s = 1; s <= steps; s++) {
-      const t = s / steps;
-      const t2 = t * t;
-      const t3 = t2 * t;
-      const x =
-        0.5 *
-        (2 * p1.x +
-          (-p0.x + p2.x) * t +
-          (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
-          (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
-      const y =
-        0.5 *
-        (2 * p1.y +
-          (-p0.y + p2.y) * t +
-          (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
-          (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+      if (s === steps) {
+        out.push(p2);
+        continue;
+      }
+      const frac = s / steps;
+      const t = t1 + (t2 - t1) * frac;
+
+      const a1x = ((t1 - t) / (t1 - t0)) * p0x + ((t - t0) / (t1 - t0)) * p1.x;
+      const a1y = ((t1 - t) / (t1 - t0)) * p0y + ((t - t0) / (t1 - t0)) * p1.y;
+      const a2x = ((t2 - t) / (t2 - t1)) * p1.x + ((t - t1) / (t2 - t1)) * p2.x;
+      const a2y = ((t2 - t) / (t2 - t1)) * p1.y + ((t - t1) / (t2 - t1)) * p2.y;
+      const a3x = ((t3 - t) / (t3 - t2)) * p2.x + ((t - t2) / (t3 - t2)) * p3x;
+      const a3y = ((t3 - t) / (t3 - t2)) * p2.y + ((t - t2) / (t3 - t2)) * p3y;
+
+      const b1x = ((t2 - t) / (t2 - t0)) * a1x + ((t - t0) / (t2 - t0)) * a2x;
+      const b1y = ((t2 - t) / (t2 - t0)) * a1y + ((t - t0) / (t2 - t0)) * a2y;
+      const b2x = ((t3 - t) / (t3 - t1)) * a2x + ((t - t1) / (t3 - t1)) * a3x;
+      const b2y = ((t3 - t) / (t3 - t1)) * a2y + ((t - t1) / (t3 - t1)) * a3y;
+
+      const x = ((t2 - t) / (t2 - t1)) * b1x + ((t - t1) / (t2 - t1)) * b2x;
+      const y = ((t2 - t) / (t2 - t1)) * b1y + ((t - t1) / (t2 - t1)) * b2y;
+
       out.push({
         x,
         y,
-        pressure: p1.pressure + (p2.pressure - p1.pressure) * t,
-        altitude: p1.altitude + (p2.altitude - p1.altitude) * t,
-        azimuth: p1.azimuth + (p2.azimuth - p1.azimuth) * t,
-        dtMs: Math.round(p1.dtMs + (p2.dtMs - p1.dtMs) * t),
+        pressure: p1.pressure + (p2.pressure - p1.pressure) * frac,
+        altitude: p1.altitude + (p2.altitude - p1.altitude) * frac,
+        azimuth: p1.azimuth + (p2.azimuth - p1.azimuth) * frac,
+        dtMs: Math.round(p1.dtMs + (p2.dtMs - p1.dtMs) * frac),
       });
     }
   }

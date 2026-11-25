@@ -28,7 +28,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   toolbarDock: 'top',
   fingerDrawMode: true,
   scribbleEraseEnabled: true,
-  predictionLookaheadMs: 16,
+  predictionLookaheadMs: 12,
   audioPreRollMs: 2000,
   penColorPresets: ['#18181b', '#c85a32', '#1d4ed8', '#15803d', '#7c2d12', '#475569'],
   highlighterColorPresets: ['#facc15', '#4ade80', '#60a5fa', '#fb7185', '#f59e0b', '#a78bfa'],

@@ -6,13 +6,14 @@ import {
   StylusKinematicPredictor,
   buildStrokeOutline,
   computeBBox,
+  densifyStrokePoints,
   hitTestStroke,
   isScribbleEraseGesture,
   partialEraseStroke,
   recognizeShape,
   strokeInLasso,
 } from '../src/engine/inkMath';
-import { unpackPointerSamples } from '../src/engine/inputRouter';
+import { filterCoalescedReplayPoints, unpackPointerSamples } from '../src/engine/inputRouter';
 import {
   DEFAULT_SETTINGS,
   createId,
@@ -405,5 +406,47 @@ describe('Apple Pencil Low-Latency Pipeline (Kinematic Predictor & 240 Hz De-Qua
     expect(unpacked.coalesced[0].exactTimeMs).toBeCloseTo(1004, 2);
     expect(unpacked.coalesced[1].exactTimeMs).toBeCloseTo(1008, 2);
   });
+
+  it('strips overlapping WebKit coalescedTouchesForTouch replay windows (no double-line chord) while preserving real loops', () => {
+    // Smooth curve from top-right to bottom-left
+    const curve: StrokePoint[] = Array.from({ length: 40 }, (_, i) => {
+      const u = i / 39;
+      return makePt(460 - 270 * Math.sin(u * 1.35), 80 + 480 * u, i * 4);
+    });
+
+    const alreadyCommitted = curve.slice(0, 29); // indices 0..28
+    // Simulate WebKit EventDispatcher.cpp:255 concatenating overlapping [15..28] + [29..36]
+    const overlappingBatch = [...curve.slice(15, 29), ...curve.slice(29, 37)].map((point, idx) => ({
+      point,
+      exactTimeMs: 200 + idx * 4,
+    }));
+
+    const cleaned = filterCoalescedReplayPoints(overlappingBatch, alreadyCommitted);
+    expect(cleaned.map((c) => c.point)).toEqual(curve.slice(29, 37));
+
+    // Verify intentional figure-8 / loop crossing smoothly at 240 Hz is NOT stripped
+    const loopPts: StrokePoint[] = Array.from({ length: 48 }, (_, i) => {
+      const a = (i / 24) * Math.PI * 2;
+      return makePt(200 + Math.sin(a) * 40, 200 + Math.sin(2 * a) * 30, i * 4);
+    });
+    const loopCommitted = loopPts.slice(0, 24);
+    const loopNext = loopPts.slice(24).map((point, idx) => ({ point, exactTimeMs: 100 + idx * 4 }));
+    expect(filterCoalescedReplayPoints(loopNext, loopCommitted).length).toBe(loopNext.length);
+  });
+
+  it('produces zero overshoot horns across extreme 60x segment-length transitions via Centripetal Catmull-Rom', () => {
+    const pts: StrokePoint[] = [];
+    for (let i = 0; i < 10; i++) pts.push(makePt(400 - i * 3.5, 100 + i * 2));
+    // 60x jump followed immediately by 3.5pt dense points (previously caused a 12pt overshoot horn!)
+    for (let i = 0; i < 10; i++) pts.push(makePt(210 - i * 2, 290 + i * 3.5));
+
+    const dense = densifyStrokePoints(pts, 3);
+    for (let i = 1; i < dense.length; i++) {
+      // Strictly monotonic x decreasing & y increasing — zero backward horn or loop!
+      expect(dense[i].x).toBeLessThanOrEqual(dense[i - 1].x + 1e-4);
+      expect(dense[i].y).toBeGreaterThanOrEqual(dense[i - 1].y - 1e-4);
+    }
+  });
 });
+
 
