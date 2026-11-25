@@ -28,7 +28,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   toolbarDock: 'top',
   fingerDrawMode: true,
   scribbleEraseEnabled: true,
-  predictionLookaheadMs: 12,
+  predictionLookaheadMs: 10,
   audioPreRollMs: 2000,
   penColorPresets: ['#18181b', '#c85a32', '#1d4ed8', '#15803d', '#7c2d12', '#475569'],
   highlighterColorPresets: ['#facc15', '#4ade80', '#60a5fa', '#fb7185', '#f59e0b', '#a78bfa'],
@@ -46,12 +46,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
     accountEmail: null,
     lastSyncedAt: null,
     status: 'local-only',
-  },
-  pro: {
-    isPro: false,
-    purchasedAt: null,
-    receiptId: null,
-    freeNoteLimit: 5,
   },
 };
 
@@ -324,12 +318,13 @@ class QuireStorage {
       req.onerror = () => reject(req.error);
     });
     if (!stored) return { ...DEFAULT_SETTINGS };
+    const cleanStored = { ...(stored as Record<string, unknown>) };
+    delete cleanStored.pro;
     return {
       ...DEFAULT_SETTINGS,
-      ...stored,
+      ...(cleanStored as Partial<AppSettings>),
       backup: { ...DEFAULT_SETTINGS.backup, ...(stored.backup ?? {}) },
       sync: { ...DEFAULT_SETTINGS.sync, ...(stored.sync ?? {}) },
-      pro: { ...DEFAULT_SETTINGS.pro, ...(stored.pro ?? {}) },
     };
   }
 

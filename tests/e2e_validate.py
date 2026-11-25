@@ -243,23 +243,15 @@ def main():
             page.screenshot(path=str(SHOT_DIR / "05_library_dark_conflict.png"))
             print("[PASS] CUJ 6 Dark Mode & Non-Destructive Conflict Copy verified")
 
-            # --- CUJ 7: Free-to-Pro 5-Note Gate & One-Time Unlock ---
-            # Currently have 3 notes; create 2 more to reach 5 free notes
-            for _ in range(2):
+            # --- Unlimited Note Creation (Zero Paywall / No Pro Gate) ---
+            for _ in range(3):
                 page.click("#btn-new-note")
                 page.wait_for_selector(".page-slot")
                 page.click("#btn-back-library")
-            assert page.locator(".note-card").count() == 5
-
-            # Attempt 6th note -> Pro Upgrade sheet should appear cleanly
-            page.click("#btn-new-note")
-            page.wait_for_selector("#btn-confirm-pro-unlock", timeout=3000)
-            page.click("#btn-confirm-pro-unlock")
-            page.wait_for_selector(".pro-chip", timeout=3000)
-            # Now 6th note succeeds!
-            page.click("#btn-new-note")
-            page.wait_for_selector(".page-slot")
-            print("[PASS] CUJ 7 Free-to-Pro 5-note gate & one-time unlock verified")
+            assert page.locator(".note-card").count() == 6
+            assert page.locator("#btn-confirm-pro-unlock").count() == 0
+            assert page.locator(".pro-chip").count() == 0
+            print("[PASS] Unlimited note creation verified (6 notes created with zero Pro gate)")
 
             browser.close()
 

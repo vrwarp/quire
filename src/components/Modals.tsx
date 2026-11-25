@@ -2,7 +2,6 @@ import { useState } from 'preact/hooks';
 import {
   ArrowDown,
   ArrowUp,
-  Check,
   Cloud,
   Copy,
   Download,
@@ -10,8 +9,6 @@ import {
   FilePlus,
   Image as ImageIcon,
   Layers,
-  ShieldCheck,
-  Sparkles,
   Trash2,
   X,
 } from 'lucide-preact';
@@ -512,20 +509,14 @@ export function SettingsModal({
   onSimulateConflictSync,
   onTriggerBackupNow,
   onClose,
-  onOpenUpgrade,
 }: {
   settings: AppSettings;
   onUpdateSettings: (next: AppSettings) => void;
   onSimulateConflictSync: () => void;
   onTriggerBackupNow: () => void;
   onClose: () => void;
-  onOpenUpgrade: () => void;
 }) {
   const updateBackupProvider = (provider: AppSettings['backup']['provider']) => {
-    if (provider !== 'none' && !settings.pro.isPro) {
-      onOpenUpgrade();
-      return;
-    }
     onUpdateSettings({
       ...settings,
       backup: {
@@ -617,14 +608,14 @@ export function SettingsModal({
 
             <div class="field-group">
               <label>
-                Apple Pencil Prediction Lookahead ({settings.predictionLookaheadMs ?? 16} ms)
+                Apple Pencil Prediction Lookahead ({settings.predictionLookaheadMs ?? 10} ms)
               </label>
               <input
                 type="range"
                 min={0}
                 max={24}
                 step={2}
-                value={settings.predictionLookaheadMs ?? 16}
+                value={settings.predictionLookaheadMs ?? 10}
                 onInput={(e) =>
                   onUpdateSettings({
                     ...settings,
@@ -700,7 +691,7 @@ export function SettingsModal({
             </div>
 
             <div class="field-group">
-              <label>One-Way Auto-Backup {!settings.pro.isPro && '(Pro)'}</label>
+              <label>One-Way Auto-Backup</label>
               <div class="option-grid">
                 {(['none', 'google-drive', 'dropbox'] as const).map((prov) => (
                   <button
@@ -763,87 +754,6 @@ export function SettingsModal({
               full-screen standalone canvas, ~60% disk OPFS quota, and Wake Lock audio continuity.
             </div>
           </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ============================================================================
-   5. Respectful Free-to-Pro One-Time Unlock Sheet (CUJ 7)
-   ============================================================================ */
-export function ProUpgradeModal({
-  onUnlockPro,
-  onRestorePro,
-  onClose,
-}: {
-  onUnlockPro: () => void;
-  onRestorePro: () => void;
-  onClose: () => void;
-}) {
-  return (
-    <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="pro-heading">
-      <div class="modal-sheet">
-        <div class="modal-header">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Sparkles size={19} color="var(--accent)" />
-            <h2 id="pro-heading">Unlock Quire Pro — One-Time Purchase</h2>
-          </div>
-          <button type="button" class="btn-icon" onClick={onClose} aria-label="Close Upgrade">
-            <X size={18} />
-          </button>
-        </div>
-
-        <p style={{ margin: 0, fontSize: '13.5px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-          No subscriptions, no recurring nags. Your existing 5 free notes always remain 100%
-          readable, editable, and exportable with zero watermarks.
-        </p>
-
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '8px',
-            padding: '14px',
-            borderRadius: '12px',
-            background: 'var(--surface-2)',
-            fontSize: '13.5px',
-          }}
-        >
-          {[
-            'Unlimited handwritten notes & multi-page PDFs',
-            'Automatic background backup to Google Drive & Dropbox',
-            '120 Hz ProMotion ink engine & stroke-synced audio across all devices',
-            'Offline-verified Ed25519 receipt — works forever without an account',
-          ].map((perk) => (
-            <div key={perk} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Check size={15} color="var(--success)" />
-              <span>{perk}</span>
-            </div>
-          ))}
-        </div>
-
-        <button
-          id="btn-confirm-pro-unlock"
-          type="button"
-          class="btn-primary"
-          style={{ width: '100%', padding: '12px', fontSize: '15px' }}
-          onClick={onUnlockPro}
-        >
-          <ShieldCheck size={17} /> Unlock Pro Forever — $14.99
-        </button>
-
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12.5px' }}>
-          <button
-            type="button"
-            style={{ color: 'var(--text-secondary)', textDecoration: 'underline' }}
-            onClick={onRestorePro}
-          >
-            Restore Previous Purchase
-          </button>
-          <button type="button" style={{ color: 'var(--text-secondary)' }} onClick={onClose}>
-            Keep Using Free Tier
-          </button>
         </div>
       </div>
     </div>

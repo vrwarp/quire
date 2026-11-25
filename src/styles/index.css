@@ -210,16 +210,6 @@ select:focus-visible {
   border-radius: 7px;
 }
 
-.pro-chip {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 2px 7px;
-  border-radius: var(--radius-pill);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
 
 .sidebar-actions {
   display: flex;
