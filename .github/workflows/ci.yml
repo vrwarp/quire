@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Typecheck, Build, Unit & E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run unit tests (Vitest)
+        run: npm test
+
+      - name: Typecheck & production build
+        run: npm run build
+
+      - name: Setup Python for Playwright E2E
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright & Chromium
+        run: |
+          python3 -m pip install --upgrade pip playwright
+          python3 -m playwright install --with-deps chromium
+
+      - name: Run Playwright E2E validation (CUJ 1–7)
+        env:
+          E2E_OUTPUT_DIR: ${{ runner.temp }}/quire-e2e
+          PLAYWRIGHT_USE_BUNDLED: '1'
+        run: python3 tests/e2e_validate.py
+
+      - name: Upload E2E screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: ${{ runner.temp }}/quire-e2e/screenshots
+          if-no-files-found: ignore

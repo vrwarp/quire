@@ -1,0 +1,28 @@
+{
+  "name": "quire",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "lucide-preact": "^1.80.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.5.438",
+    "preact": "^11.1.1"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "@types/node": "^24.19.2",
+    "@vitest/coverage-v8": "^5.1.1",
+    "jsdom": "^31.0.1",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6",
+    "vitest": "^5.1.1"
+  }
+}
