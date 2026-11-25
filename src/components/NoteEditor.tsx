@@ -43,6 +43,7 @@ import { ProMotionGovernor } from '../engine/promotion';
 import { createScrollBus } from '../engine/scrollBus';
 import {
   OneEuroFilter,
+  StylusKinematicPredictor,
   computeBBox,
   hitTestStroke,
   isScribbleEraseGesture,
@@ -96,8 +97,10 @@ export function NoteEditor({
   const fallbackWetCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const governorRef = useRef<ProMotionGovernor | null>(null);
   const palmGuardRef = useRef(new PalmRejectionGuard(250));
-  const filterXRef = useRef(new OneEuroFilter(1.4, 0.04));
-  const filterYRef = useRef(new OneEuroFilter(1.4, 0.04));
+  // High-cutoff micro-filter used ONLY for coarse mouse/finger; Apple Pencil uses 0ms raw 240Hz coords
+  const filterXRef = useRef(new OneEuroFilter(22.0, 0.35));
+  const filterYRef = useRef(new OneEuroFilter(22.0, 0.35));
+  const predictorRef = useRef(new StylusKinematicPredictor());
   const audioRecorderRef = useRef<AudioSyncRecorder | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const undoStackRef = useRef<UndoCommand[]>([]);
@@ -158,16 +161,23 @@ export function NoteEditor({
     cachedPdfTiles: 0,
   });
 
-  // Active in-progress drawing state (kept in refs for zero React re-renders during 120 Hz ink!)
+  // Active in-progress drawing state (kept in refs with cached geometry so pointermove does 0 DOM reflows!)
   const activeStrokeRef = useRef<{
     pointerId: number;
+    pointerType: string;
     page: PageDescriptor;
     pageEl: HTMLDivElement;
+    pageLeft: number;
+    pageTop: number;
+    offsetX: number;
+    offsetY: number;
     tool: 'pen' | 'highlighter';
     color: string;
     width: number;
+    paperTheme: PaperTheme;
     points: StrokePoint[];
     startPerf: number;
+    lastBatchPerf: number;
     audioSessionId?: string;
     startAudioMs?: number;
     dwellTimer: number;
@@ -191,27 +201,26 @@ export function NoteEditor({
     const dpr = window.devicePixelRatio || 1;
     if (msg.type === 'clear') {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-    } else if (msg.type === 'wet-stroke') {
+    } else if (msg.type === 'wet-start' || msg.type === 'wet-append' || msg.type === 'wet-replace') {
+      const cur = activeStrokeRef.current;
+      if (!cur) return;
+      const pts =
+        msg.type === 'wet-append' ? [...cur.points, ...msg.predicted] : cur.points;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.save();
       ctx.scale(dpr, dpr);
-      ctx.translate(msg.offsetX, msg.offsetY);
+      ctx.translate(cur.offsetX, cur.offsetY);
       ctx.scale(msg.zoom, msg.zoom);
       drawVectorStroke(
         ctx,
-        {
-          tool: msg.tool,
-          color: msg.color,
-          width: msg.width,
-          points: [...msg.points, ...msg.predicted],
-        },
-        msg.paperTheme
+        { tool: cur.tool, color: cur.color, width: cur.width, points: pts },
+        cur.paperTheme
       );
       ctx.restore();
     }
   }, []);
 
-  // 1. Mount ProMotion 120 Hz Governor + OffscreenCanvas InkRenderWorker + 120 Hz Scroll Bus
+  // 1. Mount ProMotion 120 Hz Governor + WebGL2 OffscreenCanvas InkRenderWorker + 120 Hz Scroll Bus
   useEffect(() => {
     const wrapper = stageWrapperRef.current;
     const scroller = scrollerRef.current;
@@ -219,7 +228,8 @@ export function NoteEditor({
     if (!wrapper || !scroller || !wetCanvas) return;
 
     const governor = new ProMotionGovernor(wrapper, {
-      holdMs: 850,
+      holdMs: 15_000,
+      pacerPeriodMs: 120,
       onStatusChange: (active) =>
         setTelemetry((prev) => ({
           ...prev,
@@ -228,6 +238,17 @@ export function NoteEditor({
         })),
     });
     governorRef.current = governor;
+    // Immediately pre-warm 120 Hz ProMotion when NoteEditor mounts so first Pencil stroke has 0ms PLL ramp lag!
+    governor.wake();
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        governor.park();
+      } else {
+        governor.wake();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
 
     const dpr = Math.min(2.5, window.devicePixelRatio || 1);
     const rect = wrapper.getBoundingClientRect();
@@ -322,6 +343,7 @@ export function NoteEditor({
     });
 
     return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
       detachMultiFinger();
       scroller.removeEventListener('scroll', onScroll);
       scroller.removeEventListener('touchstart', onScroll);
@@ -333,6 +355,15 @@ export function NoteEditor({
       governor.dispose();
     };
   }, []);
+
+  // Keep ProMotion 120 Hz warm when selecting ink tools; park in passive Read/Pan mode
+  useEffect(() => {
+    if (effectiveTool === 'pan') {
+      governorRef.current?.park();
+    } else {
+      governorRef.current?.wake();
+    }
+  }, [effectiveTool]);
 
   // Jump to requested page from Page Manager or PDF internal link
   useEffect(() => {
@@ -566,13 +597,20 @@ export function NoteEditor({
       applyEraserAt(page.pageId, xPt, yPt);
       activeStrokeRef.current = {
         pointerId: e.pointerId,
+        pointerType: e.pointerType,
         page,
         pageEl,
+        pageLeft: pRect.left,
+        pageTop: pRect.top,
+        offsetX,
+        offsetY,
         tool: 'pen',
         color: 'eraser',
         width: 14,
+        paperTheme: 'light',
         points: [],
-        startPerf: e.timeStamp,
+        startPerf: e.timeStamp || performance.now(),
+        lastBatchPerf: e.timeStamp || performance.now(),
         dwellTimer: 0,
       };
       return;
@@ -600,25 +638,31 @@ export function NoteEditor({
       return;
     }
 
-    // Pen or Highlighter stroke start
+    // Pen or Highlighter stroke start — ZERO filter lag on Apple Pencil!
     const inkTool = effectiveTool === 'highlighter' ? 'highlighter' : 'pen';
     const color = inkTool === 'highlighter' ? hlColor : penColor;
     const width = inkTool === 'highlighter' ? hlWidth : penWidth;
+    const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
+    const startPerf = e.timeStamp || performance.now();
 
+    const isPen = e.pointerType === 'pen';
     filterXRef.current.reset();
     filterYRef.current.reset();
-    const fx = filterXRef.current.filter(xPt, e.timeStamp);
-    const fy = filterYRef.current.filter(yPt, e.timeStamp);
+    predictorRef.current.reset();
+
+    const fx = isPen ? xPt : filterXRef.current.filter(xPt, startPerf);
+    const fy = isPen ? yPt : filterYRef.current.filter(yPt, startPerf);
 
     const anyE = e as PointerEvent & { altitudeAngle?: number; azimuthAngle?: number };
     const firstPt: StrokePoint = {
       x: fx,
       y: fy,
-      pressure: e.pointerType === 'pen' ? e.pressure || 0.5 : 0.5,
+      pressure: isPen ? e.pressure || 0.5 : 0.5,
       altitude: anyE.altitudeAngle ?? Math.PI / 2,
       azimuth: anyE.azimuthAngle ?? 0,
       dtMs: 0,
     };
+    predictorRef.current.pushSample(firstPt, startPerf);
 
     const audioSessionId =
       recordingState === 'recording' ? audioRecorderRef.current?.activeSessionId ?? undefined : undefined;
@@ -627,21 +671,28 @@ export function NoteEditor({
 
     activeStrokeRef.current = {
       pointerId: e.pointerId,
+      pointerType: e.pointerType,
       page,
       pageEl,
+      pageLeft: pRect.left,
+      pageTop: pRect.top,
+      offsetX,
+      offsetY,
       tool: inkTool,
       color,
       width,
+      paperTheme,
       points: [firstPt],
-      startPerf: e.timeStamp,
+      startPerf,
+      lastBatchPerf: startPerf,
       audioSessionId,
       startAudioMs,
       dwellTimer: 0,
     };
 
-    const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
+    // Dispatch wet-start immediately (<0.1ms) so initial pen-down dot renders on the very next 120 Hz scanout!
     sendToWetWorker({
-      type: 'wet-stroke',
+      type: 'wet-start',
       tool: inkTool,
       color,
       width,
@@ -649,23 +700,17 @@ export function NoteEditor({
       offsetX,
       offsetY,
       zoom,
-      points: [firstPt],
-      predicted: [],
+      point: firstPt,
     });
   };
 
   const handlePointerMove = (e: PointerEvent, page: PageDescriptor, pageEl: HTMLDivElement) => {
     if (e.pointerType === 'touch' && palmGuardRef.current.shouldRejectTouch(e)) return;
 
-    const { offsetX, offsetY, pRect } = getPageOffsets(pageEl);
-    const toPageCoords = (cx: number, cy: number) => ({
-      x: (cx - pRect.left) / zoom,
-      y: (cy - pRect.top) / zoom,
-    });
-
     // Active Lasso marquee or drag
     if (effectiveTool === 'lasso') {
-      const pt = toPageCoords(e.clientX, e.clientY);
+      const { offsetX, offsetY, pRect } = getPageOffsets(pageEl);
+      const pt = { x: (e.clientX - pRect.left) / zoom, y: (e.clientY - pRect.top) / zoom };
       const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
       if (lassoDragRef.current.active) {
         lassoDragRef.current.dx = pt.x - lassoDragRef.current.startX;
@@ -712,7 +757,12 @@ export function NoteEditor({
 
     const active = activeStrokeRef.current;
     if (!active || active.pointerId !== e.pointerId) return;
-    governorRef.current?.wake();
+
+    // ZERO DOM reflows on the hot ink path: use cached pageLeft / pageTop from pointerdown!
+    const toPageCoords = (cx: number, cy: number) => ({
+      x: (cx - active.pageLeft) / zoom,
+      y: (cy - active.pageTop) / zoom,
+    });
 
     // Active Eraser sweep
     if (active.color === 'eraser') {
@@ -721,19 +771,56 @@ export function NoteEditor({
       return;
     }
 
-    // Unpack 240 Hz coalesced + UIKit predicted samples
-    const { coalesced, predicted } = unpackPointerSamples(e, toPageCoords, active.startPerf);
+    // Unpack 240 Hz coalesced + UIKit predicted samples with de-quantized timestamps
+    const { coalesced, predicted: nativePredicted } = unpackPointerSamples(
+      e,
+      toPageCoords,
+      active.startPerf,
+      active.lastBatchPerf
+    );
+    active.lastBatchPerf = e.timeStamp || performance.now();
+
+    const isPen = active.pointerType === 'pen';
+    const newPoints: StrokePoint[] = [];
     let movedDist = 0;
-    for (const raw of coalesced) {
-      const fx = filterXRef.current.filter(raw.x, active.startPerf + raw.dtMs);
-      const fy = filterYRef.current.filter(raw.y, active.startPerf + raw.dtMs);
+
+    for (const item of coalesced) {
+      const raw = item.point;
+      // Zero filter delay for Apple Pencil; fast 22Hz micro-smoothing only for mouse/finger
+      const fx = isPen ? raw.x : filterXRef.current.filter(raw.x, item.exactTimeMs);
+      const fy = isPen ? raw.y : filterYRef.current.filter(raw.y, item.exactTimeMs);
       const prev = active.points[active.points.length - 1];
       const d = Math.hypot(fx - prev.x, fy - prev.y);
-      if (d >= 0.45) {
+      if (d >= 0.12) {
         movedDist += d;
-        active.points.push({ ...raw, x: fx, y: fy });
+        const accepted: StrokePoint = { ...raw, x: fx, y: fy };
+        active.points.push(accepted);
+        newPoints.push(accepted);
+        predictorRef.current.pushSample(accepted, item.exactTimeMs);
       }
     }
+
+    if (newPoints.length === 0) return;
+
+    // Compute 2nd-order curvature-damped kinematic predicted tip (solves WebKit Bug 284852 + pipeline lag!)
+    const lastCommitted = active.points[active.points.length - 1];
+    const predictedTip = active.snappedKind
+      ? []
+      : predictorRef.current.predict(
+          lastCommitted,
+          nativePredicted,
+          settings.predictionLookaheadMs ?? 16
+        );
+
+    // Stream ONLY O(1) delta points + transient predicted tip to WebGL2 OffscreenCanvas worker!
+    sendToWetWorker({
+      type: 'wet-append',
+      offsetX: active.offsetX,
+      offsetY: active.offsetY,
+      zoom,
+      newPoints,
+      predicted: predictedTip,
+    });
 
     // Reset 400ms Hold-to-Snap shape dwell timer whenever stylus moves
     if (movedDist > 2.2) {
@@ -746,39 +833,21 @@ export function NoteEditor({
         if (recognized) {
           cur.points = recognized.snappedPoints;
           cur.snappedKind = recognized.kind;
-          const pTheme: PaperTheme = cur.page.source.kind === 'template' ? cur.page.source.theme : 'light';
-          const offs = getPageOffsets(cur.pageEl);
           sendToWetWorker({
-            type: 'wet-stroke',
+            type: 'wet-replace',
             tool: cur.tool,
             color: cur.color,
             width: cur.width,
-            paperTheme: pTheme,
-            offsetX: offs.offsetX,
-            offsetY: offs.offsetY,
+            paperTheme: cur.paperTheme,
+            offsetX: cur.offsetX,
+            offsetY: cur.offsetY,
             zoom,
             points: cur.points,
-            predicted: [],
             snapBadge: `Snapped: ${recognized.kind}`,
           });
         }
       }, 400);
     }
-
-    const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
-    sendToWetWorker({
-      type: 'wet-stroke',
-      tool: active.tool,
-      color: active.color,
-      width: active.width,
-      paperTheme,
-      offsetX,
-      offsetY,
-      zoom,
-      points: active.points,
-      predicted,
-      snapBadge: active.snappedKind ? `Snapped: ${active.snappedKind}` : undefined,
-    });
   };
 
   const handlePointerUp = (e: PointerEvent, page: PageDescriptor, pageEl: HTMLDivElement) => {
@@ -898,8 +967,22 @@ export function NoteEditor({
       endAudioMs,
     };
 
+    if (active.tool === 'pen') {
+      sendToWetWorker({
+        type: 'wet-append',
+        offsetX: active.offsetX,
+        offsetY: active.offsetY,
+        zoom,
+        newPoints: [],
+        predicted: [],
+      });
+    }
     mutatePageStrokes(page.pageId, (prev) => [...prev, committed], 'Add stroke');
-    sendToWetWorker({ type: 'clear' });
+    window.requestAnimationFrame(() => {
+      if (!activeStrokeRef.current) {
+        sendToWetWorker({ type: 'clear' });
+      }
+    });
   };
 
   const applyEraserAt = (pageId: string, xPt: number, yPt: number) => {
@@ -1229,10 +1312,14 @@ export function NoteEditor({
           <span
             id="telemetry-hz-pill"
             class={`hz-pill ${telemetry.boostActive ? 'boosted' : ''}`}
-            title={`Backend: ${telemetry.rendererBackend} | Ink render: ${telemetry.lastInkLatencyMs}ms | Cached PDF tiles: ${telemetry.cachedPdfTiles}`}
+            title={`Backend: ${telemetry.rendererBackend} | Ink GPU pass: ${telemetry.lastInkLatencyMs}ms | Prediction: ${settings.predictionLookaheadMs}ms | Cached PDF tiles: ${telemetry.cachedPdfTiles}`}
           >
             <span class="hz-dot" />
-            {telemetry.offscreenCanvasActive ? '120Hz Offscreen' : 'Canvas'}
+            {telemetry.offscreenCanvasActive
+              ? telemetry.rendererBackend === 'webgl2'
+                ? '120Hz WebGL2'
+                : '120Hz Offscreen'
+              : 'Canvas'}
             {telemetry.lastInkLatencyMs > 0 ? ` · ${telemetry.lastInkLatencyMs}ms` : ''}
           </span>
 

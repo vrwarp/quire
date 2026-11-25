@@ -516,3 +516,124 @@ export function generateOrderKey(prev?: string | null, next?: string | null): st
   const b = next ? parseFloat(next) : a + 1000;
   return String((a + b) / 2);
 }
+
+/**
+ * 2nd-Order Curvature-Damped Kinematic Stylus Predictor.
+ *
+ * Compensates for the ~12–16 ms WebProcess -> GPUProcess -> UIProcess presentation pipeline
+ * AND works around WebKit Bug 284852 (WKTouchEventsGestureRecognizer.mm:372), where iPadOS
+ * drops `getPredictedEvents()` whenever a resting palm occupies `touchIndex == 0`.
+ *
+ * Strictly transient: predicted points are rendered only at the live wet-ink tip and
+ * replaced on the very next frame by true 240 Hz Apple Pencil samples.
+ */
+export class StylusKinematicPredictor {
+  private history: Array<{ x: number; y: number; pressure: number; tMs: number }> = [];
+  private vx = 0;
+  private vy = 0;
+  private ax = 0;
+  private ay = 0;
+
+  reset(): void {
+    this.history.length = 0;
+    this.vx = 0;
+    this.vy = 0;
+    this.ax = 0;
+    this.ay = 0;
+  }
+
+  pushSample(pt: StrokePoint, tMs: number): void {
+    const n = this.history.length;
+    if (n > 0) {
+      const prev = this.history[n - 1];
+      const dt = Math.max(2.5, tMs - prev.tMs);
+      const instVx = (pt.x - prev.x) / dt;
+      const instVy = (pt.y - prev.y) / dt;
+
+      if (n === 1) {
+        this.vx = instVx;
+        this.vy = instVy;
+      } else {
+        const nextVx = 0.62 * instVx + 0.38 * this.vx;
+        const nextVy = 0.62 * instVy + 0.38 * this.vy;
+        const instAx = (nextVx - this.vx) / dt;
+        const instAy = (nextVy - this.vy) / dt;
+        this.ax = 0.45 * instAx + 0.55 * this.ax;
+        this.ay = 0.45 * instAy + 0.55 * this.ay;
+        this.vx = nextVx;
+        this.vy = nextVy;
+      }
+    }
+
+    this.history.push({ x: pt.x, y: pt.y, pressure: pt.pressure, tMs });
+    if (this.history.length > 6) {
+      this.history.shift();
+    }
+  }
+
+  predict(
+    lastPoint: StrokePoint,
+    nativePredicted: StrokePoint[],
+    lookaheadMs: number
+  ): StrokePoint[] {
+    if (lookaheadMs <= 0 || this.history.length < 2) {
+      return nativePredicted;
+    }
+
+    const speed = Math.hypot(this.vx, this.vy); // pt / ms (e.g. 0.5 = 500 pt/s)
+    if (speed < 0.035) {
+      // Near-stationary (<35 pt/s): avoid micro-jitter while holding to snap shapes
+      return [];
+    }
+
+    // Curvature attenuation so sharp corners/hooks never overshoot
+    const cross = Math.abs(this.vx * this.ay - this.vy * this.ax);
+    const curvature = cross / Math.max(speed * speed * speed, 1e-4);
+    const turnDamping = Math.max(0.28, Math.min(1.0, 1 / (1 + 140 * curvature * speed)));
+
+    const horizonMs = lookaheadMs * turnDamping;
+    const accelWeight = 0.32 * turnDamping;
+    const maxLeadPt = Math.min(34, speed * horizonMs * 1.25 + 2);
+
+    const steps = 3;
+    const out: StrokePoint[] = [];
+
+    for (let i = 1; i <= steps; i++) {
+      const frac = i / steps;
+      const dt = horizonMs * frac;
+      let dx = this.vx * dt + 0.5 * this.ax * accelWeight * dt * dt;
+      let dy = this.vy * dt + 0.5 * this.ay * accelWeight * dt * dt;
+
+      const dist = Math.hypot(dx, dy);
+      const stepCap = maxLeadPt * frac;
+      if (dist > stepCap && dist > 1e-5) {
+        dx = (dx / dist) * stepCap;
+        dy = (dy / dist) * stepCap;
+      }
+
+      let px = lastPoint.x + dx;
+      let py = lastPoint.y + dy;
+
+      // Blend with UIKit's native predictedTouches when available (e.g. first ~8ms step)
+      if (i <= nativePredicted.length) {
+        const np = nativePredicted[i - 1];
+        px = 0.45 * np.x + 0.55 * px;
+        py = 0.45 * np.y + 0.55 * py;
+      }
+
+      // Gently taper tip pressure slightly on final predicted sub-point for natural nib feel
+      const tipPressure = Math.max(0.15, lastPoint.pressure * (1 - 0.08 * frac));
+
+      out.push({
+        x: px,
+        y: py,
+        pressure: tipPressure,
+        altitude: lastPoint.altitude,
+        azimuth: lastPoint.azimuth,
+        dtMs: lastPoint.dtMs + Math.round(dt),
+      });
+    }
+
+    return out;
+  }
+}

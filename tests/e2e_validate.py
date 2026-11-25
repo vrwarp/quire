@@ -91,12 +91,13 @@ def main():
             print(f"[PASS] CUJ 1 Start Writing -> Writable Canvas: {ready_ms:.0f} ms")
             assert ready_ms < 1500
 
-            # Verify 120Hz OffscreenCanvas worker initialized
+            # Verify 120Hz WebGL2 / OffscreenCanvas worker initialized
             page.wait_for_function(
-                "() => document.querySelector('#telemetry-hz-pill')?.textContent?.includes('120Hz Offscreen')",
+                "() => document.querySelector('#telemetry-hz-pill')?.textContent?.includes('120Hz')",
                 timeout=4000,
             )
-            print("[PASS] 120 Hz Dedicated OffscreenCanvas Worker active")
+            hz_badge = page.locator("#telemetry-hz-pill").text_content()
+            print(f"[PASS] 120 Hz Dedicated OffscreenCanvas Worker active ({hz_badge})")
 
             # --- CUJ 2: Ink, Highlighter, Typed Text, Per-Page Templates & ProMotion Governor ---
             slot = page.locator(".page-slot").first

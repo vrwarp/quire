@@ -616,6 +616,25 @@ export function SettingsModal({
             </label>
 
             <div class="field-group">
+              <label>
+                Apple Pencil Prediction Lookahead ({settings.predictionLookaheadMs ?? 16} ms)
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={24}
+                step={2}
+                value={settings.predictionLookaheadMs ?? 16}
+                onInput={(e) =>
+                  onUpdateSettings({
+                    ...settings,
+                    predictionLookaheadMs: parseInt((e.target as HTMLInputElement).value, 10),
+                  })
+                }
+              />
+            </div>
+
+            <div class="field-group">
               <label>Audio Tap-to-Jump Pre-Roll</label>
               <select
                 value={settings.audioPreRollMs}
