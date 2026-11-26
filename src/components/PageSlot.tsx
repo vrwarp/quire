@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type {
   ImageItem,
   PageDescriptor,
@@ -7,9 +7,22 @@ import type {
   ToolKind,
   VectorStroke,
 } from '../types';
-import { renderDryHighlighterLayer, renderDryPenLayer } from '../engine/canvasRenderer';
+import {
+  appendDryPenStroke,
+  renderDryHighlighterLayer,
+  renderDryPenLayer,
+} from '../engine/canvasRenderer';
 import { pdfEngine, type PdfLinkAnnotation } from '../engine/pdfEngine';
 import { quireStorage } from '../engine/storage';
+
+function sameStrokeRefs(a: VectorStroke[], b: VectorStroke[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 interface PageSlotProps {
   page: PageDescriptor;
@@ -70,6 +83,25 @@ export function PageSlot({
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
   const hlCanvasRef = useRef<HTMLCanvasElement>(null);
   const penCanvasRef = useRef<HTMLCanvasElement>(null);
+  const pdfBitmapRef = useRef<ImageBitmap | null>(null);
+
+  const prevHlStateRef = useRef<{
+    strokes: VectorStroke[];
+    widthPt: number;
+    heightPt: number;
+    scale: number;
+    paperTheme: PaperTheme;
+  } | null>(null);
+
+  const prevPenStateRef = useRef<{
+    strokes: VectorStroke[];
+    widthPt: number;
+    heightPt: number;
+    scale: number;
+    paperTheme: PaperTheme;
+    replaySessionId: string | null;
+    replayTimeMs: number;
+  } | null>(null);
 
   const [pdfLinks, setPdfLinks] = useState<PdfLinkAnnotation[]>([]);
   const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
@@ -83,9 +115,48 @@ export function PageSlot({
   const scaledW = Math.round(page.widthPt * zoom);
   const scaledH = Math.round(page.heightPt * zoom);
 
+  const visibleHlStrokes = useMemo(
+    () =>
+      strokes.filter(
+        (s) => s.tool === 'highlighter' && (hiddenStrokeIds.size === 0 || !hiddenStrokeIds.has(s.id))
+      ),
+    [strokes, hiddenStrokeIds]
+  );
+
+  const visiblePenStrokes = useMemo(
+    () =>
+      strokes.filter(
+        (s) => s.tool === 'pen' && (hiddenStrokeIds.size === 0 || !hiddenStrokeIds.has(s.id))
+      ),
+    [strokes, hiddenStrokeIds]
+  );
+
+  const compositePdfWithHighlighters = useCallback((hasHighlighters: boolean) => {
+    const pdfCanvas = pdfCanvasRef.current;
+    const bitmap = pdfBitmapRef.current;
+    if (!pdfCanvas || !bitmap) return;
+    if (pdfCanvas.width !== bitmap.width || pdfCanvas.height !== bitmap.height) {
+      pdfCanvas.width = bitmap.width;
+      pdfCanvas.height = bitmap.height;
+    }
+    const ctx = pdfCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(bitmap, 0, 0);
+    if (hasHighlighters && hlCanvasRef.current && hlCanvasRef.current.width > 0) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.drawImage(hlCanvasRef.current, 0, 0, pdfCanvas.width, pdfCanvas.height);
+      ctx.restore();
+    }
+  }, []);
+
   // Render lazy PDF tile only when page is inside the visible ±2 virtualization window
   useEffect(() => {
-    if (!isVisible || page.source.kind !== 'pdf') return;
+    if (!isVisible || page.source.kind !== 'pdf') {
+      pdfBitmapRef.current = null;
+      return;
+    }
     let cancelled = false;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const renderScale = Math.max(1, zoom * dpr);
@@ -93,11 +164,8 @@ export function PageSlot({
 
     void pdfEngine.renderPageTile(blobKey, pdfPageNumber, renderScale, rotation).then((bitmap) => {
       if (cancelled || !bitmap || !pdfCanvasRef.current) return;
-      const canvas = pdfCanvasRef.current;
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
-      const ctx = canvas.getContext('2d');
-      ctx?.drawImage(bitmap, 0, 0);
+      pdfBitmapRef.current = bitmap;
+      compositePdfWithHighlighters((prevHlStateRef.current?.strokes.length ?? 0) > 0);
     });
 
     void pdfEngine.getPageLinks(blobKey, pdfPageNumber).then((links) => {
@@ -107,33 +175,129 @@ export function PageSlot({
     return () => {
       cancelled = true;
     };
-  }, [isVisible, page.source, zoom]);
+  }, [isVisible, page.source, zoom, compositePdfWithHighlighters]);
 
-  // Render Dry Highlighter + Dry Pen layers whenever strokes or replay state change
-  useEffect(() => {
-    if (!isVisible) return;
+  // Synchronously commit Dry Highlighter + Dry Pen updates BEFORE the next browser paint frame
+  // (avoids Preact useEffect's rAF + setTimeout 2-frame blink and skips untouched layers in O(1))
+  useLayoutEffect(() => {
+    if (!isVisible) {
+      prevHlStateRef.current = null;
+      prevPenStateRef.current = null;
+      return;
+    }
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const scale = zoom * dpr;
 
     if (hlCanvasRef.current) {
-      renderDryHighlighterLayer(
-        hlCanvasRef.current,
-        strokes,
-        page.widthPt,
-        page.heightPt,
-        scale,
-        paperTheme,
-        hiddenStrokeIds
-      );
+      const prevHl = prevHlStateRef.current;
+      const hlUnchanged =
+        prevHl !== null &&
+        prevHl.widthPt === page.widthPt &&
+        prevHl.heightPt === page.heightPt &&
+        prevHl.scale === scale &&
+        prevHl.paperTheme === paperTheme &&
+        sameStrokeRefs(prevHl.strokes, visibleHlStrokes);
+
+      if (!hlUnchanged) {
+        renderDryHighlighterLayer(
+          hlCanvasRef.current,
+          visibleHlStrokes,
+          page.widthPt,
+          page.heightPt,
+          scale,
+          paperTheme
+        );
+        prevHlStateRef.current = {
+          strokes: visibleHlStrokes,
+          widthPt: page.widthPt,
+          heightPt: page.heightPt,
+          scale,
+          paperTheme,
+        };
+        if (page.source.kind === 'pdf') {
+          compositePdfWithHighlighters(visibleHlStrokes.length > 0);
+        }
+      }
     }
+
     if (penCanvasRef.current) {
-      renderDryPenLayer(penCanvasRef.current, strokes, page.widthPt, page.heightPt, scale, paperTheme, {
-        hiddenIds: hiddenStrokeIds,
-        replaySessionId,
-        replayTimeMs,
-      });
+      const prevPen = prevPenStateRef.current;
+      const geometrySame =
+        prevPen !== null &&
+        prevPen.widthPt === page.widthPt &&
+        prevPen.heightPt === page.heightPt &&
+        prevPen.scale === scale &&
+        prevPen.paperTheme === paperTheme;
+      const noReplay = !replaySessionId && !prevPen?.replaySessionId;
+
+      if (geometrySame && noReplay && prevPen && sameStrokeRefs(prevPen.strokes, visiblePenStrokes)) {
+        // Zero pen changes (e.g. Highlighter stroke or unrelated state): skip Dry Pen redraw completely
+      } else {
+        let didIncrementalAppend = false;
+        if (
+          geometrySame &&
+          noReplay &&
+          prevPen &&
+          visiblePenStrokes.length === prevPen.strokes.length + 1
+        ) {
+          let prefixMatches = true;
+          for (let i = 0; i < prevPen.strokes.length; i++) {
+            if (prevPen.strokes[i] !== visiblePenStrokes[i]) {
+              prefixMatches = false;
+              break;
+            }
+          }
+          if (prefixMatches) {
+            didIncrementalAppend = appendDryPenStroke(
+              penCanvasRef.current,
+              visiblePenStrokes[visiblePenStrokes.length - 1],
+              page.widthPt,
+              page.heightPt,
+              scale,
+              paperTheme
+            );
+          }
+        }
+
+        if (!didIncrementalAppend) {
+          renderDryPenLayer(
+            penCanvasRef.current,
+            visiblePenStrokes,
+            page.widthPt,
+            page.heightPt,
+            scale,
+            paperTheme,
+            {
+              replaySessionId,
+              replayTimeMs,
+            }
+          );
+        }
+
+        prevPenStateRef.current = {
+          strokes: visiblePenStrokes,
+          widthPt: page.widthPt,
+          heightPt: page.heightPt,
+          scale,
+          paperTheme,
+          replaySessionId,
+          replayTimeMs: replaySessionId ? replayTimeMs : 0,
+        };
+      }
     }
-  }, [isVisible, strokes, page.widthPt, page.heightPt, zoom, paperTheme, hiddenStrokeIds, replaySessionId, replayTimeMs]);
+  }, [
+    isVisible,
+    visibleHlStrokes,
+    visiblePenStrokes,
+    page.widthPt,
+    page.heightPt,
+    page.source.kind,
+    zoom,
+    paperTheme,
+    replaySessionId,
+    replayTimeMs,
+    compositePdfWithHighlighters,
+  ]);
 
   // Load object URLs for embedded images
   useEffect(() => {
@@ -286,7 +450,11 @@ export function PageSlot({
           })}
 
           {/* Single-Layer Non-Darkening Highlighter Canvas (Always BELOW Pen Ink!) */}
-          <canvas ref={hlCanvasRef} class="page-layer highlighter-layer" />
+          <canvas
+            ref={hlCanvasRef}
+            class="page-layer highlighter-layer"
+            style={page.source.kind === 'pdf' ? { display: 'none' } : undefined}
+          />
 
           {/* Crisp Vector Dry Pen Canvas */}
           <canvas ref={penCanvasRef} class="page-layer" />
