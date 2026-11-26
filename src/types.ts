@@ -4,6 +4,7 @@ export type ScrollDirection = 'vertical' | 'horizontal';
 export type ToolbarDock = 'top' | 'left' | 'right';
 export type ToolKind = 'pen' | 'highlighter' | 'eraser' | 'lasso' | 'text' | 'pan';
 export type EraserMode = 'stroke' | 'partial';
+export type EraserSizePreset = 'small' | 'medium' | 'large';
 export type ShapeKind = 'freehand' | 'line' | 'arrow' | 'rectangle' | 'ellipse' | 'triangle';
 
 export interface StrokePoint {
@@ -160,7 +161,8 @@ export interface AppSettings {
   darkMode: boolean;
   toolbarDock: ToolbarDock;
   fingerDrawMode: boolean;
-  scribbleEraseEnabled: boolean;
+  eraserSize: EraserSizePreset;
+  eraserAutoReturn: boolean;
   predictionLookaheadMs: number;
   audioPreRollMs: number;
   penColorPresets: string[];

@@ -593,14 +593,14 @@ export function SettingsModal({
             </label>
 
             <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '13.5px' }}>
-              <span>Scribble-Scratch Quick Erase</span>
+              <span>Auto-Return to Pen After Erasing</span>
               <input
                 type="checkbox"
-                checked={settings.scribbleEraseEnabled}
+                checked={settings.eraserAutoReturn}
                 onChange={(e) =>
                   onUpdateSettings({
                     ...settings,
-                    scribbleEraseEnabled: (e.target as HTMLInputElement).checked,
+                    eraserAutoReturn: (e.target as HTMLInputElement).checked,
                   })
                 }
               />

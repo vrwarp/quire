@@ -6,14 +6,19 @@ import {
   StylusKinematicPredictor,
   buildStrokeOutline,
   computeBBox,
+  createSnappedShapeDescriptor,
   densifyStrokePoints,
   hitTestStroke,
-  isScribbleEraseGesture,
   partialEraseStroke,
   recognizeShape,
   strokeInLasso,
+  updateSnappedShape,
 } from '../src/engine/inkMath';
-import { filterCoalescedReplayPoints, unpackPointerSamples } from '../src/engine/inputRouter';
+import {
+  PalmRejectionGuard,
+  filterCoalescedReplayPoints,
+  unpackPointerSamples,
+} from '../src/engine/inputRouter';
 import {
   DEFAULT_SETTINGS,
   createId,
@@ -80,6 +85,36 @@ describe('Quire Ink Math & Recognition Engine (FR-INK-01..05)', () => {
     expect(circleRes?.kind).toBe('ellipse');
   });
 
+  it('dynamically stretches and scales snapped shapes when dragging after Hold-to-Snap', () => {
+    const linePts = Array.from({ length: 10 }, (_, i) => makePt(20 + i * 10, 40, i * 10));
+    const lineRes = recognizeShape(linePts)!;
+    expect(lineRes.kind).toBe('line');
+    const lineDesc = createSnappedShapeDescriptor('line', lineRes.snappedPoints, linePts[linePts.length - 1]);
+    const stretched = updateSnappedShape(lineDesc, 260, 100);
+    expect(stretched[0].x).toBeCloseTo(20, 1);
+    expect(stretched[0].y).toBeCloseTo(40, 1);
+    expect(stretched[stretched.length - 1].x).toBeCloseTo(260, 1);
+    expect(stretched[stretched.length - 1].y).toBeCloseTo(100, 1);
+
+    const circlePts = Array.from({ length: 36 }, (_, i) => {
+      const a = (i / 35) * Math.PI * 2;
+      return makePt(200 + Math.cos(a) * 40, 200 + Math.sin(a) * 40, i * 10);
+    });
+    const circleRes = recognizeShape(circlePts)!;
+    const circleDesc = createSnappedShapeDescriptor(
+      'ellipse',
+      circleRes.snappedPoints,
+      circlePts[circlePts.length - 1]
+    );
+    // Dragging twice as far from the anchor doubles the circle diameter
+    const targetX = circleDesc.anchor.x + (circleDesc.snapTip.x - circleDesc.anchor.x) * 2;
+    const targetY = circleDesc.anchor.y + (circleDesc.snapTip.y - circleDesc.anchor.y) * 2;
+    const resized = updateSnappedShape(circleDesc, targetX, targetY);
+    const origBox = computeBBox(circleRes.snappedPoints, 0);
+    const newBox = computeBBox(resized, 0);
+    expect((newBox.maxX - newBox.minX) / (origBox.maxX - origBox.minX)).toBeCloseTo(2, 1);
+  });
+
   it('splits a vector stroke cleanly into 2 child strokes with analytical partial eraser (FR-INK-03)', () => {
     const pts = Array.from({ length: 21 }, (_, i) => makePt(i * 10, 50, i * 8));
     const stroke: VectorStroke = {
@@ -126,13 +161,13 @@ describe('Quire Ink Math & Recognition Engine (FR-INK-01..05)', () => {
     expect(strokeInLasso(outsideStroke, poly)).toBe(false);
   });
 
-  it('detects rapid scribble-scratch gesture for quick erase', () => {
-    const scribble: StrokePoint[] = [];
-    for (let i = 0; i < 24; i++) {
-      const x = i % 4 < 2 ? 100 + (i % 2) * 40 : 140 - (i % 2) * 40;
-      scribble.push(makePt(x, 100 + i * 1.2, i * 12));
-    }
-    expect(isScribbleEraseGesture(scribble)).toBe(true);
+  it('suppresses touch and multi-finger gestures while Apple Pencil is active or in cooldown', () => {
+    const guard = new PalmRejectionGuard(250);
+    expect(guard.isSuppressedNow()).toBe(false);
+    guard.notePenDown();
+    expect(guard.isSuppressedNow()).toBe(true);
+    guard.notePenUp();
+    expect(guard.isSuppressedNow()).toBe(true);
   });
 });
 

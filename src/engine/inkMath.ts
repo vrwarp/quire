@@ -511,31 +511,138 @@ export function strokeInLasso(stroke: VectorStroke, polygon: Array<{ x: number; 
   return checked > 0 && hits / checked >= 0.45;
 }
 
+export interface SnappedShapeDescriptor {
+  kind: Exclude<ShapeKind, 'freehand'>;
+  anchor: { x: number; y: number };
+  snapTip: { x: number; y: number };
+  basePoints: StrokePoint[];
+  avgPressure: number;
+  altitude: number;
+  azimuth: number;
+  endDtMs: number;
+}
+
 /**
- * Detects a rapid 3-oscillation scribble-scratch gesture (optional quick erase replacement for
- * Apple Pencil double-tap on WebKit).
+ * Builds a SnappedShapeDescriptor anchored at the point farthest from the stylus tip
+ * (or at the start point for lines/arrows) so subsequent drag updates have zero jump at t=0.
  */
-export function isScribbleEraseGesture(points: StrokePoint[]): boolean {
-  if (points.length < 14) return false;
-  let directionChanges = 0;
-  let lastSign = 0;
-  let totalDist = 0;
-  for (let i = 1; i < points.length; i++) {
-    const dx = points[i].x - points[i - 1].x;
-    const dy = points[i].y - points[i - 1].y;
-    totalDist += Math.hypot(dx, dy);
-    if (Math.abs(dx) > 3) {
-      const sign = Math.sign(dx);
-      if (lastSign !== 0 && sign !== lastSign) {
-        directionChanges++;
+export function createSnappedShapeDescriptor(
+  kind: Exclude<ShapeKind, 'freehand'>,
+  snappedPoints: StrokePoint[],
+  rawTip: { x: number; y: number }
+): SnappedShapeDescriptor {
+  const first = snappedPoints[0];
+  const last = snappedPoints[snappedPoints.length - 1];
+  let anchor = { x: first.x, y: first.y };
+  let snapTip = { x: rawTip.x, y: rawTip.y };
+
+  if (kind === 'line' || kind === 'arrow') {
+    anchor = { x: first.x, y: first.y };
+    snapTip = kind === 'arrow' && snappedPoints.length >= 2
+      ? { x: snappedPoints[1].x, y: snappedPoints[1].y }
+      : { x: last.x, y: last.y };
+  } else {
+    let bestDistSq = -1;
+    for (const p of snappedPoints) {
+      const dx = p.x - rawTip.x;
+      const dy = p.y - rawTip.y;
+      const dSq = dx * dx + dy * dy;
+      if (dSq > bestDistSq) {
+        bestDistSq = dSq;
+        anchor = { x: p.x, y: p.y };
       }
-      lastSign = sign;
     }
   }
-  const bbox = computeBBox(points, 0);
-  const w = bbox.maxX - bbox.minX;
-  const h = bbox.maxY - bbox.minY;
-  return directionChanges >= 4 && w > 18 && w < 220 && h < 90 && totalDist > w * 2.8;
+
+  return {
+    kind,
+    anchor,
+    snapTip,
+    basePoints: snappedPoints.map((p) => ({ ...p })),
+    avgPressure: first.pressure,
+    altitude: first.altitude,
+    azimuth: first.azimuth,
+    endDtMs: last.dtMs,
+  };
+}
+
+/**
+ * Dynamically updates a snapped geometric shape as the user continues dragging the Apple Pencil
+ * after the 400ms Hold-to-Snap trigger:
+ * - line / arrow: keeps start anchor fixed and stretches/rotates the endpoint to (targetX, targetY)
+ * - rectangle / ellipse / triangle: applies a uniform scale + rotation similarity transform around `anchor`
+ */
+export function updateSnappedShape(
+  desc: SnappedShapeDescriptor,
+  targetX: number,
+  targetY: number
+): StrokePoint[] {
+  const mkPt = (x: number, y: number, idx: number, total: number): StrokePoint => ({
+    x,
+    y,
+    pressure: desc.avgPressure,
+    altitude: desc.altitude,
+    azimuth: desc.azimuth,
+    dtMs: Math.round((idx / Math.max(1, total - 1)) * desc.endDtMs),
+  });
+
+  if (desc.kind === 'line') {
+    const steps = 16;
+    const out: StrokePoint[] = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      out.push(
+        mkPt(
+          desc.anchor.x + (targetX - desc.anchor.x) * t,
+          desc.anchor.y + (targetY - desc.anchor.y) * t,
+          i,
+          steps + 1
+        )
+      );
+    }
+    return out;
+  }
+
+  if (desc.kind === 'arrow') {
+    const dx = targetX - desc.anchor.x;
+    const dy = targetY - desc.anchor.y;
+    const shaftLen = Math.max(12, Math.hypot(dx, dy));
+    const angle = Math.atan2(dy, dx);
+    const tip = { x: targetX, y: targetY };
+    const headSize = Math.min(22, shaftLen * 0.18);
+    const wing1 = {
+      x: tip.x - headSize * Math.cos(angle - Math.PI / 6),
+      y: tip.y - headSize * Math.sin(angle - Math.PI / 6),
+    };
+    const wing2 = {
+      x: tip.x - headSize * Math.cos(angle + Math.PI / 6),
+      y: tip.y - headSize * Math.sin(angle + Math.PI / 6),
+    };
+    const verts = [desc.anchor, tip, wing1, tip, wing2];
+    return verts.map((v, i) => mkPt(v.x, v.y, i, verts.length));
+  }
+
+  // Closed shapes (rectangle, ellipse, triangle): similarity transform around farthest anchor
+  const baseDx = desc.snapTip.x - desc.anchor.x;
+  const baseDy = desc.snapTip.y - desc.anchor.y;
+  const baseLen = Math.max(8, Math.hypot(baseDx, baseDy));
+  const curDx = targetX - desc.anchor.x;
+  const curDy = targetY - desc.anchor.y;
+  const curLen = Math.max(10, Math.hypot(curDx, curDy));
+  const scale = Math.max(0.2, Math.min(6, curLen / baseLen));
+  const deltaAngle = Math.atan2(curDy, curDx) - Math.atan2(baseDy, baseDx);
+  const cosA = Math.cos(deltaAngle);
+  const sinA = Math.sin(deltaAngle);
+
+  return desc.basePoints.map((p) => {
+    const rx = (p.x - desc.anchor.x) * scale;
+    const ry = (p.y - desc.anchor.y) * scale;
+    return {
+      ...p,
+      x: desc.anchor.x + rx * cosA - ry * sinA,
+      y: desc.anchor.y + rx * sinA + ry * cosA,
+    };
+  });
 }
 
 /**

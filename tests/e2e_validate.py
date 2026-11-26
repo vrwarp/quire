@@ -219,9 +219,7 @@ def main():
             assert wet_leftover == 0, f"Wet OffscreenCanvas left {wet_leftover} ghost pixels after pointerup!"
             print("[PASS] Wet OffscreenCanvas dirty-rect cleared to 0 ghost pixels after pen lift")
 
-            # Verify Zoom to Fit Width (with side margins) + guide lines scaling with zoom + Pinch-to-Zoom!
-            page.click("#btn-zoom-fit-width")
-            page.wait_for_timeout(80)
+            # Verify newly opened note defaults immediately to Fit Width (with side margins & zoom-scaled guide lines)!
             fit_metrics = page.evaluate("""() => {
                 const scroller = document.querySelector('#stage-scroller');
                 const slot = document.querySelector('.page-slot[data-page-index="0"]');
@@ -233,18 +231,20 @@ def main():
                     zoomVar: parseFloat(cs.getPropertyValue('--page-zoom')),
                     bgPosY: parseFloat(cs.backgroundPositionY),
                     zoomLabel: document.querySelector('#zoom-percent-label')?.textContent,
+                    padBottom: parseFloat(getComputedStyle(scroller).paddingBottom),
                 };
             }""")
-            assert fit_metrics["pressed"] == "true", f"Fit Width not active: {fit_metrics}"
+            assert fit_metrics["pressed"] == "true", f"Expected Fit Width active on open: {fit_metrics}"
             margin_total = fit_metrics["scrollerW"] - fit_metrics["slotW"]
             assert 56 <= margin_total <= 96, f"Expected side margins ~72px total, got {margin_total:.1f}px ({fit_metrics})"
             expected_bg_y = 56.0 * fit_metrics["zoomVar"]
             assert abs(fit_metrics["bgPosY"] - expected_bg_y) < 1.5, (
                 f"Guide lines did not scale with zoom: bgPosY={fit_metrics['bgPosY']}, expected={expected_bg_y}"
             )
-            print(f"[PASS] Fit Width ({fit_metrics['zoomLabel']}, {margin_total:.0f}px side margin) & zoom-scaled guide lines verified")
+            assert fit_metrics["padBottom"] >= 250, f"Expected generous bottom overscroll, got {fit_metrics['padBottom']}px"
+            print(f"[PASS] Default Fit Width ({fit_metrics['zoomLabel']}, {margin_total:.0f}px side margin, {fit_metrics['padBottom']:.0f}px bottom overscroll) verified")
 
-            # Verify Pinch-to-Zoom (Ctrl+Wheel trackpad pinch) updates zoom and exits Fit Width mode
+            # Verify Pinch-to-Zoom (Ctrl+Wheel trackpad pinch) zooms in & exits Fit Width, then snaps back magnetically
             page.evaluate("""() => {
                 const scroller = document.querySelector('#stage-scroller');
                 const r = scroller.getBoundingClientRect();
@@ -270,11 +270,57 @@ def main():
             assert after_pinch["zoomVar"] > fit_metrics["zoomVar"] + 0.1, (
                 f"Pinch-to-zoom did not zoom in: {fit_metrics['zoomVar']} -> {after_pinch['zoomVar']}"
             )
-            print(f"[PASS] Pinch-to-zoom verified ({fit_metrics['zoomLabel']} -> {after_pinch['zoomLabel']})")
+            # Pinch back down within ±6% of Fit Width -> magnetic snap re-engages Fit Width!
+            page.evaluate("""() => {
+                const scroller = document.querySelector('#stage-scroller');
+                const r = scroller.getBoundingClientRect();
+                scroller.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: 45,
+                    ctrlKey: true,
+                    clientX: r.left + r.width / 2,
+                    clientY: r.top + r.height / 2,
+                    bubbles: true,
+                    cancelable: true,
+                }));
+            }""")
+            page.wait_for_function(
+                "() => document.querySelector('#btn-zoom-fit-width')?.getAttribute('aria-pressed') === 'true'",
+                timeout=2000,
+            )
+            print(f"[PASS] Pinch-to-zoom ({fit_metrics['zoomLabel']} -> {after_pinch['zoomLabel']}) & magnetic Fit-Width snap verified")
 
-            # Return to Fit Width framing for text box and editor screenshot
-            page.click("#btn-zoom-fit-width")
-            page.wait_for_timeout(60)
+            # Verify Partial Eraser default, S/M/L size presets, Auto-Pen toggle, and clean cursor clear
+            page.click("#tool-eraser")
+            assert page.locator("#btn-eraser-mode").text_content() == "Partial", "Expected Partial Eraser default"
+            page.click("#btn-eraser-size-large")
+            assert page.locator("#btn-eraser-size-large").get_attribute("aria-pressed") == "true"
+            page.click("#btn-eraser-auto-return")
+            assert page.locator("#btn-eraser-auto-return").get_attribute("aria-pressed") == "true"
+            slot_box_er = page.locator('.page-slot[data-page-index="0"]').bounding_box()
+            assert slot_box_er is not None
+            page.mouse.move(slot_box_er["x"] + 260, slot_box_er["y"] + 240)
+            page.mouse.down()
+            page.mouse.move(slot_box_er["x"] + 280, slot_box_er["y"] + 240, steps=4)
+            page.mouse.up()
+            page.wait_for_timeout(80)
+            assert "active" in (page.locator("#tool-pen").get_attribute("class") or ""), (
+                "Expected Auto-Pen to return to Pen tool after erasing"
+            )
+            print("[PASS] Partial Eraser default, S/M/L presets, live cursor, & Auto-Pen verified")
+
+            # Verify Lasso select + tap-outside dismiss
+            page.click("#tool-lasso")
+            page.mouse.move(slot_box_er["x"] + 60, slot_box_er["y"] + 90)
+            page.mouse.down()
+            page.mouse.move(slot_box_er["x"] + 420, slot_box_er["y"] + 90, steps=4)
+            page.mouse.move(slot_box_er["x"] + 420, slot_box_er["y"] + 220, steps=4)
+            page.mouse.move(slot_box_er["x"] + 60, slot_box_er["y"] + 220, steps=4)
+            page.mouse.up()
+            page.wait_for_selector(".lasso-actions", timeout=2000)
+            # Tap outside bounding box -> dismisses cleanly
+            page.mouse.click(slot_box_er["x"] + 500, slot_box_er["y"] + 340)
+            page.wait_for_function("() => !document.querySelector('.lasso-actions')", timeout=2000)
+            print("[PASS] Lasso selection bounding box & tap-outside dismiss verified")
 
             # Add a Typed Text Box (FR-INK-06)
             page.click("#tool-text")

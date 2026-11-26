@@ -27,7 +27,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   darkMode: false,
   toolbarDock: 'top',
   fingerDrawMode: false,
-  scribbleEraseEnabled: true,
+  eraserSize: 'medium',
+  eraserAutoReturn: false,
   predictionLookaheadMs: 10,
   audioPreRollMs: 2000,
   penColorPresets: ['#18181b', '#c85a32', '#1d4ed8', '#15803d', '#7c2d12', '#475569'],
@@ -320,6 +321,7 @@ class QuireStorage {
     if (!stored) return { ...DEFAULT_SETTINGS };
     const cleanStored = { ...stored };
     delete cleanStored.pro;
+    delete cleanStored.scribbleEraseEnabled;
     const schemaVer = typeof cleanStored.settingsVersion === 'number' ? cleanStored.settingsVersion : 1;
     delete cleanStored.settingsVersion;
     const merged: AppSettings = {

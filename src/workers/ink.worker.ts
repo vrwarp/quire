@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import type { PaperTheme, StrokePoint, VectorStroke } from '../types';
+import type { BBox, PaperTheme, StrokePoint, VectorStroke } from '../types';
 import { drawVectorStroke } from '../engine/canvasRenderer';
 
 /**
@@ -68,18 +68,28 @@ export type InkWorkerMessage =
       snapBadge?: string;
     }
   | {
+      type: 'eraser-cursor';
+      offsetX: number;
+      offsetY: number;
+      zoom: number;
+      x: number;
+      y: number;
+      radiusPt: number;
+    }
+  | {
       type: 'lasso-overlay';
       offsetX: number;
       offsetY: number;
       zoom: number;
       paperTheme: PaperTheme;
       polygon: Array<{ x: number; y: number }>;
+      bbox: BBox | null;
       liftedStrokes: VectorStroke[];
       dx: number;
       dy: number;
       scale: number;
-      centerX: number;
-      centerY: number;
+      anchorX: number;
+      anchorY: number;
     }
   | {
       type: 'replay-frame';
@@ -329,6 +339,37 @@ self.onmessage = (event: MessageEvent<InkWorkerMessage>) => {
     return;
   }
 
+  if (msg.type === 'eraser-cursor') {
+    const t0 = performance.now();
+    clearPreviousDirty();
+    const cx = msg.offsetX + msg.x * msg.zoom;
+    const cy = msg.offsetY + msg.y * msg.zoom;
+    const rCss = Math.max(4, msg.radiusPt * msg.zoom);
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.beginPath();
+    ctx.arc(cx, cy, rCss, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(200, 90, 50, 0.12)';
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+    ctx.stroke();
+    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = 'rgba(24, 24, 27, 0.82)';
+    ctx.stroke();
+    ctx.restore();
+
+    const padPx = Math.ceil((rCss + 6) * dpr);
+    const x0 = Math.max(0, Math.floor(cx * dpr) - padPx);
+    const y0 = Math.max(0, Math.floor(cy * dpr) - padPx);
+    const x1 = Math.min(canvas.width, Math.ceil(cx * dpr) + padPx);
+    const y1 = Math.min(canvas.height, Math.ceil(cy * dpr) + padPx);
+    lastDirtyRect = x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+    recordPresent(t0);
+    return;
+  }
+
   if (msg.type === 'lasso-overlay') {
     const t0 = performance.now();
     clearPreviousDirty();
@@ -340,30 +381,64 @@ self.onmessage = (event: MessageEvent<InkWorkerMessage>) => {
 
     if (msg.liftedStrokes.length > 0) {
       ctx.save();
-      ctx.translate(msg.centerX + msg.dx, msg.centerY + msg.dy);
+      ctx.translate(msg.anchorX + msg.dx, msg.anchorY + msg.dy);
       ctx.scale(msg.scale, msg.scale);
-      ctx.translate(-msg.centerX, -msg.centerY);
+      ctx.translate(-msg.anchorX, -msg.anchorY);
       for (const stroke of msg.liftedStrokes) {
         drawVectorStroke(ctx, stroke, msg.paperTheme);
       }
       ctx.restore();
     }
 
-    if (msg.polygon.length >= 2) {
+    const invZoom = 1 / Math.max(0.5, msg.zoom);
+
+    if (msg.liftedStrokes.length > 0 && msg.bbox) {
+      // Draw crisp selection bounding box + 4 corner resize handles
+      const pad = 6 * invZoom;
+      const minX = msg.anchorX + (msg.bbox.minX - msg.anchorX) * msg.scale + msg.dx - pad;
+      const minY = msg.anchorY + (msg.bbox.minY - msg.anchorY) * msg.scale + msg.dy - pad;
+      const maxX = msg.anchorX + (msg.bbox.maxX - msg.anchorX) * msg.scale + msg.dx + pad;
+      const maxY = msg.anchorY + (msg.bbox.maxY - msg.anchorY) * msg.scale + msg.dy + pad;
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(200, 90, 50, 0.06)';
+      ctx.strokeStyle = '#c85a32';
+      ctx.lineWidth = 1.5 * invZoom;
+      ctx.setLineDash([5 * invZoom, 4 * invZoom]);
+      ctx.beginPath();
+      ctx.rect(minX, minY, maxX - minX, maxY - minY);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.setLineDash([]);
+      const handleR = 5.5 * invZoom;
+      const corners = [
+        { x: minX, y: minY },
+        { x: maxX, y: minY },
+        { x: maxX, y: maxY },
+        { x: minX, y: maxY },
+      ];
+      for (const c of corners) {
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, handleR, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 1.8 * invZoom;
+        ctx.strokeStyle = '#c85a32';
+        ctx.stroke();
+      }
+      ctx.restore();
+    } else if (msg.polygon.length >= 2) {
       ctx.save();
       ctx.translate(msg.dx, msg.dy);
       ctx.strokeStyle = '#c85a32';
       ctx.fillStyle = 'rgba(200, 90, 50, 0.08)';
-      ctx.lineWidth = 1.5 / Math.max(0.5, msg.zoom);
-      ctx.setLineDash([5 / Math.max(0.5, msg.zoom), 4 / Math.max(0.5, msg.zoom)]);
+      ctx.lineWidth = 1.5 * invZoom;
+      ctx.setLineDash([5 * invZoom, 4 * invZoom]);
       ctx.beginPath();
       ctx.moveTo(msg.polygon[0].x, msg.polygon[0].y);
       for (let i = 1; i < msg.polygon.length; i++) {
         ctx.lineTo(msg.polygon[i].x, msg.polygon[i].y);
-      }
-      if (msg.liftedStrokes.length > 0) {
-        ctx.closePath();
-        ctx.fill();
       }
       ctx.stroke();
       ctx.restore();
