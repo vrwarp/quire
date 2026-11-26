@@ -26,7 +26,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultScrollDirection: 'vertical',
   darkMode: false,
   toolbarDock: 'top',
-  fingerDrawMode: true,
+  fingerDrawMode: false,
   scribbleEraseEnabled: true,
   predictionLookaheadMs: 10,
   audioPreRollMs: 2000,
@@ -311,28 +311,42 @@ class QuireStorage {
 
   async loadSettings(): Promise<AppSettings> {
     const db = await this.openDB();
-    const stored = await new Promise<Partial<AppSettings> | undefined>((resolve, reject) => {
+    const stored = await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
       const tx = db.transaction(STORE_META, 'readonly');
       const req = tx.objectStore(STORE_META).get('settings');
-      req.onsuccess = () => resolve(req.result as Partial<AppSettings> | undefined);
+      req.onsuccess = () => resolve(req.result as Record<string, unknown> | undefined);
       req.onerror = () => reject(req.error);
     });
     if (!stored) return { ...DEFAULT_SETTINGS };
-    const cleanStored = { ...(stored as Record<string, unknown>) };
+    const cleanStored = { ...stored };
     delete cleanStored.pro;
-    return {
+    const schemaVer = typeof cleanStored.settingsVersion === 'number' ? cleanStored.settingsVersion : 1;
+    delete cleanStored.settingsVersion;
+    const merged: AppSettings = {
       ...DEFAULT_SETTINGS,
       ...(cleanStored as Partial<AppSettings>),
-      backup: { ...DEFAULT_SETTINGS.backup, ...(stored.backup ?? {}) },
-      sync: { ...DEFAULT_SETTINGS.sync, ...(stored.sync ?? {}) },
+      // One-time migration for pre-v2 sessions so single-finger touch pans natively by default
+      ...(schemaVer < 2 ? { fingerDrawMode: false } : {}),
+      backup: {
+        ...DEFAULT_SETTINGS.backup,
+        ...((stored.backup as Partial<AppSettings['backup']>) ?? {}),
+      },
+      sync: {
+        ...DEFAULT_SETTINGS.sync,
+        ...((stored.sync as Partial<AppSettings['sync']>) ?? {}),
+      },
     };
+    if (schemaVer < 2) {
+      void this.saveSettings(merged);
+    }
+    return merged;
   }
 
   async saveSettings(settings: AppSettings): Promise<void> {
     const db = await this.openDB();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_META, 'readwrite');
-      tx.objectStore(STORE_META).put(settings, 'settings');
+      tx.objectStore(STORE_META).put({ ...settings, settingsVersion: 2 }, 'settings');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });

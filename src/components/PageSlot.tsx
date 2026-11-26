@@ -332,11 +332,12 @@ export function PageSlot({
     };
   }, [isVisible, images]);
 
-  // Suppress iPadOS Scribble on stylus touchstart while keeping 120 Hz touchmove fully asynchronous
+  // Suppress iPadOS Scribble on stylus touchstart while keeping single-finger pan & 120 Hz touchmove asynchronous
   useEffect(() => {
     const el = slotRef.current;
     if (!el) return;
     const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length >= 2) return;
       for (let i = 0; i < e.changedTouches.length; i++) {
         const touch = e.changedTouches[i] as Touch & { touchType?: string };
         if (touch.touchType === 'stylus' || (fingerDrawMode && activeTool !== 'pan' && activeTool !== 'text')) {

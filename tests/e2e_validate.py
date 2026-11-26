@@ -104,6 +104,19 @@ def main():
             box = slot.bounding_box()
             assert box is not None
 
+            # Verify single-finger touch panning is enabled by default (not locked by touch-action: none)
+            pan_ready = page.evaluate("""() => {
+                const s = document.querySelector('.page-slot');
+                return {
+                    drawingActive: s.classList.contains('drawing-active'),
+                    touchAction: getComputedStyle(s).touchAction,
+                };
+            }""")
+            assert not pan_ready["drawingActive"] and "pan-x" in pan_ready["touchAction"] and "pan-y" in pan_ready["touchAction"], (
+                f"Expected single-finger pan-x pan-y by default, got {pan_ready}"
+            )
+            print(f"[PASS] Single-finger touch pan enabled by default ({pan_ready['touchAction']})")
+
             # Draw a pen stroke across the page
             page.mouse.move(box["x"] + 90, box["y"] + 130)
             page.mouse.down()
