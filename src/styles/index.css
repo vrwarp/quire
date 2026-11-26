@@ -847,21 +847,32 @@ select:focus-visible {
   overflow: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  display: flex;
   padding: 76px 28px 110px;
 }
 
-.stage-scroller.dir-vertical {
+.stage-scroller.dir-horizontal {
+  scroll-snap-type: x mandatory;
+}
+
+.stage-pages-track {
+  display: flex;
+  transform-origin: 0 0;
+}
+
+.stage-pages-track.dir-vertical {
   flex-direction: column;
   align-items: center;
   gap: 24px;
+  width: max-content;
+  min-width: 100%;
 }
 
-.stage-scroller.dir-horizontal {
+.stage-pages-track.dir-horizontal {
   flex-direction: row;
   align-items: center;
   gap: 28px;
-  scroll-snap-type: x mandatory;
+  width: max-content;
+  min-height: 100%;
 }
 
 .page-slot {
@@ -883,7 +894,7 @@ select:focus-visible {
   touch-action: none;
 }
 
-/* Paper Templates (Vector-sharp CSS gradients at any zoom level) */
+/* Paper Templates (Vector-sharp CSS gradients scaled smoothly with --page-zoom) */
 .paper-theme-light {
   background-color: #ffffff;
   --paper-rule: rgba(148, 163, 184, 0.34);
@@ -903,22 +914,45 @@ select:focus-visible {
 }
 
 .paper-tpl-lined {
+  --z: var(--page-zoom, 1);
+  --line-thick: max(1px, calc(1px * var(--z)));
+  --margin-x: calc(63px * var(--z));
+  --rule-step: calc(26px * var(--z));
   background-image:
-    linear-gradient(to right, transparent 63px, var(--paper-margin) 63px, var(--paper-margin) 64px, transparent 64px),
-    repeating-linear-gradient(to bottom, transparent 0, transparent 25px, var(--paper-rule) 25px, var(--paper-rule) 26px);
-  background-position: 0 56px;
+    linear-gradient(
+      to right,
+      transparent var(--margin-x),
+      var(--paper-margin) var(--margin-x),
+      var(--paper-margin) calc(var(--margin-x) + var(--line-thick)),
+      transparent calc(var(--margin-x) + var(--line-thick))
+    ),
+    repeating-linear-gradient(
+      to bottom,
+      transparent 0,
+      transparent calc(var(--rule-step) - var(--line-thick)),
+      var(--paper-rule) calc(var(--rule-step) - var(--line-thick)),
+      var(--paper-rule) var(--rule-step)
+    );
+  background-position: 0 calc(56px * var(--z));
 }
 
 .paper-tpl-grid {
+  --z: var(--page-zoom, 1);
+  --line-thick: max(1px, calc(1px * var(--z)));
   background-image:
-    linear-gradient(to right, var(--paper-rule) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--paper-rule) 1px, transparent 1px);
-  background-size: 26px 26px;
+    linear-gradient(to right, var(--paper-rule) var(--line-thick), transparent var(--line-thick)),
+    linear-gradient(to bottom, var(--paper-rule) var(--line-thick), transparent var(--line-thick));
+  background-size: calc(26px * var(--z)) calc(26px * var(--z));
 }
 
 .paper-tpl-dotted {
-  background-image: radial-gradient(circle, var(--paper-rule) 1.3px, transparent 1.3px);
-  background-size: 24px 24px;
+  --z: var(--page-zoom, 1);
+  background-image: radial-gradient(
+    circle,
+    var(--paper-rule) max(1px, calc(1.3px * var(--z))),
+    transparent max(1px, calc(1.3px * var(--z)))
+  );
+  background-size: calc(24px * var(--z)) calc(24px * var(--z));
 }
 
 .page-layer {
