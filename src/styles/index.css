@@ -847,6 +847,7 @@ select:focus-visible {
   overflow: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
   padding: 76px 28px 110px;
 }
 
@@ -883,6 +884,7 @@ select:focus-visible {
   overflow: hidden;
   contain: layout paint;
   transform-origin: top left;
+  touch-action: pan-x pan-y;
   background: #ffffff;
 }
 
