@@ -122,7 +122,13 @@ def main():
             )
             print("[PASS] ProMotion 120 Hz Governor primitives mounted during ink stroke")
 
-            # Draw a Highlighter pass over the pen ink
+            # Verify drawing ink on Page 1 automatically makes Page 2 available to write on!
+            assert page.locator(".page-slot").count() == 2, (
+                f"Expected Page 2 to auto-append after Page 1 received ink, got {page.locator('.page-slot').count()}"
+            )
+            print("[PASS] Auto-append Page N+1 verified when Page N receives ink")
+
+            # Draw a Highlighter pass over the pen ink on Page 1
             page.click("#tool-highlighter")
             page.mouse.move(box["x"] + 85, box["y"] + 132)
             page.mouse.down()
@@ -130,9 +136,9 @@ def main():
             page.mouse.up()
             page.wait_for_timeout(120)
 
-            # Verify Dry Pen + Dry Highlighter canvases both contain rendered pixels
+            # Verify Dry Pen + Dry Highlighter canvases on Page 1 both contain rendered pixels
             non_empty = page.evaluate("""() => {
-                const canvases = [...document.querySelectorAll('.page-slot canvas')];
+                const canvases = [...document.querySelectorAll('.page-slot[data-page-index="0"] canvas')];
                 return canvases.map(c => {
                     const ctx = c.getContext('2d');
                     if (!ctx) return 0;
@@ -163,7 +169,7 @@ def main():
             page.wait_for_timeout(120)
 
             after_rapid_pen = page.evaluate("""() => {
-                const canvases = [...document.querySelectorAll('.page-slot canvas')];
+                const canvases = [...document.querySelectorAll('.page-slot[data-page-index="0"] canvas')];
                 return canvases.map(c => {
                     const ctx = c.getContext('2d');
                     if (!ctx) return 0;
@@ -200,9 +206,68 @@ def main():
             assert wet_leftover == 0, f"Wet OffscreenCanvas left {wet_leftover} ghost pixels after pointerup!"
             print("[PASS] Wet OffscreenCanvas dirty-rect cleared to 0 ghost pixels after pen lift")
 
+            # Verify Zoom to Fit Width (with side margins) + guide lines scaling with zoom + Pinch-to-Zoom!
+            page.click("#btn-zoom-fit-width")
+            page.wait_for_timeout(80)
+            fit_metrics = page.evaluate("""() => {
+                const scroller = document.querySelector('#stage-scroller');
+                const slot = document.querySelector('.page-slot[data-page-index="0"]');
+                const cs = getComputedStyle(slot);
+                return {
+                    pressed: document.querySelector('#btn-zoom-fit-width')?.getAttribute('aria-pressed'),
+                    scrollerW: scroller.clientWidth,
+                    slotW: slot.getBoundingClientRect().width,
+                    zoomVar: parseFloat(cs.getPropertyValue('--page-zoom')),
+                    bgPosY: parseFloat(cs.backgroundPositionY),
+                    zoomLabel: document.querySelector('#zoom-percent-label')?.textContent,
+                };
+            }""")
+            assert fit_metrics["pressed"] == "true", f"Fit Width not active: {fit_metrics}"
+            margin_total = fit_metrics["scrollerW"] - fit_metrics["slotW"]
+            assert 56 <= margin_total <= 96, f"Expected side margins ~72px total, got {margin_total:.1f}px ({fit_metrics})"
+            expected_bg_y = 56.0 * fit_metrics["zoomVar"]
+            assert abs(fit_metrics["bgPosY"] - expected_bg_y) < 1.5, (
+                f"Guide lines did not scale with zoom: bgPosY={fit_metrics['bgPosY']}, expected={expected_bg_y}"
+            )
+            print(f"[PASS] Fit Width ({fit_metrics['zoomLabel']}, {margin_total:.0f}px side margin) & zoom-scaled guide lines verified")
+
+            # Verify Pinch-to-Zoom (Ctrl+Wheel trackpad pinch) updates zoom and exits Fit Width mode
+            page.evaluate("""() => {
+                const scroller = document.querySelector('#stage-scroller');
+                const r = scroller.getBoundingClientRect();
+                scroller.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: -45,
+                    ctrlKey: true,
+                    clientX: r.left + r.width / 2,
+                    clientY: r.top + r.height / 2,
+                    bubbles: true,
+                    cancelable: true,
+                }));
+            }""")
+            page.wait_for_function(
+                "() => document.querySelector('#btn-zoom-fit-width')?.getAttribute('aria-pressed') === 'false'",
+                timeout=2000,
+            )
+            after_pinch = page.evaluate("""() => ({
+                pressed: document.querySelector('#btn-zoom-fit-width')?.getAttribute('aria-pressed'),
+                zoomVar: parseFloat(getComputedStyle(document.querySelector('.page-slot[data-page-index="0"]')).getPropertyValue('--page-zoom')),
+                zoomLabel: document.querySelector('#zoom-percent-label')?.textContent,
+            })""")
+            assert after_pinch["pressed"] == "false", f"Pinch should exit Fit Width mode: {after_pinch}"
+            assert after_pinch["zoomVar"] > fit_metrics["zoomVar"] + 0.1, (
+                f"Pinch-to-zoom did not zoom in: {fit_metrics['zoomVar']} -> {after_pinch['zoomVar']}"
+            )
+            print(f"[PASS] Pinch-to-zoom verified ({fit_metrics['zoomLabel']} -> {after_pinch['zoomLabel']})")
+
+            # Return to Fit Width framing for text box and editor screenshot
+            page.click("#btn-zoom-fit-width")
+            page.wait_for_timeout(60)
+
             # Add a Typed Text Box (FR-INK-06)
             page.click("#tool-text")
-            page.mouse.click(box["x"] + 95, box["y"] + 210)
+            slot_box_now = page.locator('.page-slot[data-page-index="0"]').bounding_box()
+            assert slot_box_now is not None
+            page.mouse.click(slot_box_now["x"] + 95, slot_box_now["y"] + 210)
             textarea = page.locator(".canvas-textbox textarea").first
             textarea.fill("Thermodynamics: dS >= dQ / T")
             print("[PASS] CUJ 2 Typed text box created & edited")
@@ -215,19 +280,19 @@ def main():
             page.click("#tool-pen")
             page.screenshot(path=str(SHOT_DIR / "02_editor_light.png"))
 
-            # Page Manager: Insert Page 2 and switch ONLY Page 2 to Grid paper
+            # Page Manager: Insert a Grid page after Page 1 (Page 1 Lined, Page 2 Grid, Page 3 auto-appended Lined)
             page.click("#btn-open-page-manager")
             page.wait_for_selector("#btn-pm-insert-page")
             page.screenshot(path=str(SHOT_DIR / "03_page_manager.png"))
             page.select_option('select[aria-label="Template style"]', "grid")
             page.click("#btn-pm-insert-page")
-            assert page.locator(".page-thumb-card").count() == 2
+            assert page.locator(".page-thumb-card").count() == 3
             page.click('button[aria-label="Close Page Manager"]')
-            assert page.locator(".page-slot").count() == 2
+            assert page.locator(".page-slot").count() == 3
             p1_cls = page.locator(".page-slot").nth(0).get_attribute("class")
             p2_cls = page.locator(".page-slot").nth(1).get_attribute("class")
             assert "paper-tpl-lined" in p1_cls and "paper-tpl-grid" in p2_cls
-            print("[PASS] CUJ 2 Per-page template switching verified (Page 1 Lined, Page 2 Grid)")
+            print("[PASS] CUJ 2 Per-page template switching verified (Page 1 Lined, Page 2 Grid, Page 3 ready)")
 
             # --- CUJ 6: True Vector PDF Export ---
             page.click("#btn-open-export")

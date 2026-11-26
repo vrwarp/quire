@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   ChevronLeft,
   Download,
@@ -45,6 +45,7 @@ import {
   OneEuroFilter,
   StylusKinematicPredictor,
   computeBBox,
+  generateOrderKey,
   hitTestStroke,
   isScribbleEraseGesture,
   partialEraseStroke,
@@ -57,7 +58,7 @@ import {
   unpackPointerSamples,
 } from '../engine/inputRouter';
 import { AudioSyncRecorder, formatDuration } from '../engine/audio';
-import { createId, quireStorage } from '../engine/storage';
+import { createBlankPage, createId, quireStorage } from '../engine/storage';
 import { drawVectorStroke } from '../engine/canvasRenderer';
 import { pdfEngine } from '../engine/pdfEngine';
 import type { InkWorkerMessage } from '../workers/ink.worker';
@@ -95,10 +96,12 @@ export function NoteEditor({
 }: NoteEditorProps) {
   const stageWrapperRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const pagesTrackRef = useRef<HTMLDivElement>(null);
   const wetCanvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const hzPillRef = useRef<HTMLSpanElement>(null);
   const hzLatencySpanRef = useRef<HTMLSpanElement>(null);
+  const pendingScrollRestoreRef = useRef<{ left: number; top: number } | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
   const fallbackWetCtxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -124,11 +127,19 @@ export function NoteEditor({
   const [penWidth, setPenWidth] = useState(2.8);
   const [hlWidth, setHlWidth] = useState(18);
   const [zoom, setZoom] = useState(1);
+  const [fitWidthMode, setFitWidthMode] = useState(false);
   const [activePageIndex, setActivePageIndex] = useState(0);
   const [selectedTextBoxId, setSelectedTextBoxId] = useState<string | null>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const [tagInputOpen, setTagInputOpen] = useState(false);
   const [tagDraft, setTagDraft] = useState('');
+
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const fitWidthModeRef = useRef(fitWidthMode);
+  fitWidthModeRef.current = fitWidthMode;
+  const activePageIndexRef = useRef(activePageIndex);
+  activePageIndexRef.current = activePageIndex;
 
   // Lasso state
   const [lassoPageId, setLassoPageId] = useState<string | null>(null);
@@ -311,6 +322,13 @@ export function NoteEditor({
         wetCanvas.width = Math.round(r.width * curDpr);
         wetCanvas.height = Math.round(r.height * curDpr);
       }
+      if (fitWidthModeRef.current) {
+        const page = noteRef.current.pages[activePageIndexRef.current] ?? noteRef.current.pages[0];
+        const pageW = page?.widthPt ?? 612;
+        const availableW = Math.max(240, scroller.clientWidth - 72);
+        const nextFit = Math.max(0.5, Math.min(4, Number((availableW / pageW).toFixed(3))));
+        setZoom(nextFit);
+      }
     });
     resizeObs.observe(wrapper);
 
@@ -345,12 +363,220 @@ export function NoteEditor({
     scroller.addEventListener('touchstart', onScroll, { passive: true });
     scroller.addEventListener('wheel', onScroll, { passive: true });
 
+    // Pinch-to-Zoom (2-finger touch with temporary touchmove, Safari gesture*, and Ctrl+Wheel trackpad)
+    // Uses GPU transform preview during the gesture and commits crisp vector zoom on gesture end.
+    const pinch = {
+      active: false,
+      source: 'none' as 'none' | 'touch' | 'gesture' | 'wheel',
+      startZoom: 1,
+      targetZoom: 1,
+      startDist: 1,
+      startMidX: 0,
+      startMidY: 0,
+      curMidX: 0,
+      curMidY: 0,
+      baseLeft: 0,
+      baseTop: 0,
+      ax: 0,
+      ay: 0,
+      startScrollLeft: 0,
+      startScrollTop: 0,
+      wheelTimer: 0,
+    };
+
+    const clampZoom = (z: number) => Math.max(0.5, Math.min(4, Number(z.toFixed(3))));
+
+    const beginPinch = (
+      source: 'touch' | 'gesture' | 'wheel',
+      midX: number,
+      midY: number,
+      startDist: number
+    ) => {
+      const track = pagesTrackRef.current;
+      if (!track) return;
+      window.clearTimeout(pinch.wheelTimer);
+      const trackRect = track.getBoundingClientRect();
+      pinch.active = true;
+      pinch.source = source;
+      pinch.startZoom = zoomRef.current;
+      pinch.targetZoom = zoomRef.current;
+      pinch.startDist = Math.max(10, startDist);
+      pinch.startMidX = midX;
+      pinch.startMidY = midY;
+      pinch.curMidX = midX;
+      pinch.curMidY = midY;
+      pinch.baseLeft = trackRect.left;
+      pinch.baseTop = trackRect.top;
+      pinch.ax = midX - trackRect.left;
+      pinch.ay = midY - trackRect.top;
+      pinch.startScrollLeft = scroller.scrollLeft;
+      pinch.startScrollTop = scroller.scrollTop;
+      track.style.willChange = 'transform';
+      governor.wake();
+    };
+
+    const previewPinch = (nextZoomRaw: number, curMidX: number, curMidY: number) => {
+      const track = pagesTrackRef.current;
+      if (!track || !pinch.active) return;
+      const nextZoom = clampZoom(nextZoomRaw);
+      const ratio = nextZoom / pinch.startZoom;
+      const tx = curMidX - pinch.baseLeft - ratio * pinch.ax;
+      const ty = curMidY - pinch.baseTop - ratio * pinch.ay;
+      track.style.transform = `translate3d(${tx}px, ${ty}px, 0) scale(${ratio})`;
+      pinch.targetZoom = nextZoom;
+      pinch.curMidX = curMidX;
+      pinch.curMidY = curMidY;
+      governor.wake();
+    };
+
+    const commitPinch = () => {
+      if (!pinch.active) return;
+      const track = pagesTrackRef.current;
+      const ratio = pinch.targetZoom / pinch.startZoom;
+      const nextLeft = Math.max(
+        0,
+        pinch.startScrollLeft + pinch.ax * (ratio - 1) - (pinch.curMidX - pinch.startMidX)
+      );
+      const nextTop = Math.max(
+        0,
+        pinch.startScrollTop + pinch.ay * (ratio - 1) - (pinch.curMidY - pinch.startMidY)
+      );
+      const nextZoom = pinch.targetZoom;
+      const changed = Math.abs(nextZoom - pinch.startZoom) > 0.004;
+
+      pinch.active = false;
+      pinch.source = 'none';
+      window.clearTimeout(pinch.wheelTimer);
+
+      if (track) {
+        track.style.transform = '';
+        track.style.willChange = '';
+      }
+      setFitWidthMode(false);
+
+      if (changed) {
+        pendingScrollRestoreRef.current = { left: nextLeft, top: nextTop };
+        setZoom(nextZoom);
+      } else {
+        scroller.scrollLeft = nextLeft;
+        scroller.scrollTop = nextTop;
+      }
+    };
+
+    const onPinchTouchMove = (e: TouchEvent) => {
+      if (!pinch.active || pinch.source !== 'touch' || e.touches.length < 2) return;
+      e.preventDefault();
+      const t0 = e.touches[0];
+      const t1 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      const midX = (t0.clientX + t1.clientX) / 2;
+      const midY = (t0.clientY + t1.clientY) / 2;
+      previewPinch(pinch.startZoom * (dist / pinch.startDist), midX, midY);
+    };
+
+    const detachTempTouchPinch = () => {
+      window.removeEventListener('touchmove', onPinchTouchMove);
+      window.removeEventListener('touchend', onPinchTouchEnd);
+      window.removeEventListener('touchcancel', onPinchTouchEnd);
+    };
+
+    const onPinchTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2) {
+        detachTempTouchPinch();
+        if (pinch.active && pinch.source === 'touch') {
+          commitPinch();
+        }
+      }
+    };
+
+    const onPinchTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 2) return;
+      // If a finger stroke started moments before the 2nd finger landed, cancel it cleanly
+      if (activeStrokeRef.current && activeStrokeRef.current.pointerType !== 'pen') {
+        window.clearTimeout(activeStrokeRef.current.dwellTimer);
+        activeStrokeRef.current = null;
+        wetSeqRef.current += 1;
+        sendToWetWorker({ type: 'clear' });
+      }
+      const t0 = e.touches[0];
+      const t1 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      const midX = (t0.clientX + t1.clientX) / 2;
+      const midY = (t0.clientY + t1.clientY) / 2;
+      beginPinch('touch', midX, midY, dist);
+      // Dynamically attach non-passive touchmove ONLY during active 2-finger pinch!
+      window.addEventListener('touchmove', onPinchTouchMove, { passive: false });
+      window.addEventListener('touchend', onPinchTouchEnd, { passive: true });
+      window.addEventListener('touchcancel', onPinchTouchEnd, { passive: true });
+    };
+
+    type SafariGestureEvent = Event & { scale?: number; clientX?: number; clientY?: number };
+    const onGestureStart = (ev: Event) => {
+      const e = ev as SafariGestureEvent;
+      e.preventDefault();
+      if (!pinch.active) {
+        const sr = scroller.getBoundingClientRect();
+        beginPinch(
+          'gesture',
+          e.clientX ?? sr.left + sr.width / 2,
+          e.clientY ?? sr.top + sr.height / 2,
+          100
+        );
+      }
+    };
+    const onGestureChange = (ev: Event) => {
+      const e = ev as SafariGestureEvent;
+      e.preventDefault();
+      if (pinch.active && pinch.source === 'gesture' && typeof e.scale === 'number') {
+        previewPinch(
+          pinch.startZoom * e.scale,
+          e.clientX ?? pinch.curMidX,
+          e.clientY ?? pinch.curMidY
+        );
+      }
+    };
+    const onGestureEnd = (ev: Event) => {
+      ev.preventDefault();
+      if (pinch.active && pinch.source === 'gesture') {
+        commitPinch();
+      }
+    };
+
+    const onPinchWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      if (!pinch.active) {
+        beginPinch('wheel', e.clientX, e.clientY, 100);
+      }
+      const factor = Math.exp(-e.deltaY * 0.01);
+      previewPinch(pinch.targetZoom * factor, e.clientX, e.clientY);
+      window.clearTimeout(pinch.wheelTimer);
+      pinch.wheelTimer = window.setTimeout(() => {
+        if (pinch.active && pinch.source === 'wheel') {
+          commitPinch();
+        }
+      }, 100);
+    };
+
+    scroller.addEventListener('touchstart', onPinchTouchStart, { passive: true });
+    scroller.addEventListener('gesturestart', onGestureStart, { passive: false });
+    scroller.addEventListener('gesturechange', onGestureChange, { passive: false });
+    scroller.addEventListener('gestureend', onGestureEnd, { passive: false });
+    scroller.addEventListener('wheel', onPinchWheel, { passive: false });
+
     const detachMultiFinger = attachMultiFingerUndoRedo(scroller, {
       onUndo: () => performUndo(),
       onRedo: () => performRedo(),
     });
 
     return () => {
+      detachTempTouchPinch();
+      window.clearTimeout(pinch.wheelTimer);
+      scroller.removeEventListener('touchstart', onPinchTouchStart);
+      scroller.removeEventListener('gesturestart', onGestureStart);
+      scroller.removeEventListener('gesturechange', onGestureChange);
+      scroller.removeEventListener('gestureend', onGestureEnd);
+      scroller.removeEventListener('wheel', onPinchWheel);
       detachMultiFinger();
       scroller.removeEventListener('scroll', onScroll);
       scroller.removeEventListener('touchstart', onScroll);
@@ -362,6 +588,35 @@ export function NoteEditor({
       governor.dispose();
     };
   }, []);
+
+  // Restore scroll anchor synchronously after a pinch-to-zoom commit updates page layout
+  useLayoutEffect(() => {
+    const restore = pendingScrollRestoreRef.current;
+    if (!restore || !scrollerRef.current) return;
+    pendingScrollRestoreRef.current = null;
+    scrollerRef.current.scrollLeft = restore.left;
+    scrollerRef.current.scrollTop = restore.top;
+  }, [zoom]);
+
+  const computeFitWidthZoom = useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return 1;
+    const page = noteRef.current.pages[activePageIndexRef.current] ?? noteRef.current.pages[0];
+    const pageW = page?.widthPt ?? 612;
+    const horizontalMargin = 72; // 36px margin on either side
+    const availableW = Math.max(240, scroller.clientWidth - horizontalMargin);
+    return Math.max(0.5, Math.min(4, Number((availableW / pageW).toFixed(3))));
+  }, []);
+
+  const toggleFitWidth = useCallback(() => {
+    setFitWidthMode((prev) => {
+      const next = !prev;
+      if (next) {
+        setZoom(computeFitWidthZoom());
+      }
+      return next;
+    });
+  }, [computeFitWidthZoom]);
 
   // Jump to requested page from Page Manager or PDF internal link
   useEffect(() => {
@@ -492,10 +747,39 @@ export function NoteEditor({
       const before = noteRef.current.strokesByPage[pageId] ?? [];
       const after = updater(before);
       const apply = (list: VectorStroke[]) => {
+        const cur = noteRef.current;
+        const lastPage = cur.pages[cur.pages.length - 1];
+        const shouldAppendNextPage =
+          list.length > 0 && lastPage !== undefined && lastPage.pageId === pageId;
+
+        let nextPages = cur.pages;
+        const nextStrokesByPage = { ...cur.strokesByPage, [pageId]: list };
+        let nextTextBoxesByPage = cur.textBoxesByPage;
+        let nextImagesByPage = cur.imagesByPage;
+
+        if (shouldAppendNextPage) {
+          const tpl =
+            lastPage.source.kind === 'template'
+              ? lastPage.source.template
+              : settings.defaultTemplate;
+          const theme =
+            lastPage.source.kind === 'template'
+              ? lastPage.source.theme
+              : settings.defaultPaperTheme;
+          const nextPage = createBlankPage(tpl, theme, generateOrderKey(lastPage.orderKey));
+          nextPages = [...cur.pages, nextPage];
+          nextStrokesByPage[nextPage.pageId] = [];
+          nextTextBoxesByPage = { ...cur.textBoxesByPage, [nextPage.pageId]: [] };
+          nextImagesByPage = { ...cur.imagesByPage, [nextPage.pageId]: [] };
+        }
+
         const next: NoteDocument = {
-          ...noteRef.current,
+          ...cur,
           updatedAt: Date.now(),
-          strokesByPage: { ...noteRef.current.strokesByPage, [pageId]: list },
+          pages: nextPages,
+          strokesByPage: nextStrokesByPage,
+          textBoxesByPage: nextTextBoxesByPage,
+          imagesByPage: nextImagesByPage,
         };
         onUpdateNote(next);
       };
@@ -506,7 +790,7 @@ export function NoteEditor({
         redo: () => apply(after),
       });
     },
-    [onUpdateNote, pushCommand]
+    [onUpdateNote, pushCommand, settings.defaultTemplate, settings.defaultPaperTheme]
   );
 
   const getPageOffsets = (pageEl: HTMLDivElement) => {
@@ -1421,25 +1705,58 @@ export function NoteEditor({
           </button>
 
           <button
+            id="btn-zoom-out"
             type="button"
             class="btn-icon"
             title="Zoom Out"
             aria-label="Zoom Out"
-            onClick={() => setZoom((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))))}
+            onClick={() => {
+              setFitWidthMode(false);
+              setZoom((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))));
+            }}
           >
             <ZoomOut size={16} />
           </button>
-          <span style={{ fontSize: '11.5px', fontFamily: 'var(--font-mono)', minWidth: '38px', textAlign: 'center' }}>
+          <span
+            id="zoom-percent-label"
+            style={{ fontSize: '11.5px', fontFamily: 'var(--font-mono)', minWidth: '38px', textAlign: 'center' }}
+          >
             {Math.round(zoom * 100)}%
           </span>
           <button
+            id="btn-zoom-in"
             type="button"
             class="btn-icon"
             title="Zoom In"
             aria-label="Zoom In"
-            onClick={() => setZoom((z) => Math.min(4, Number((z + 0.25).toFixed(2))))}
+            onClick={() => {
+              setFitWidthMode(false);
+              setZoom((z) => Math.min(4, Number((z + 0.25).toFixed(2))));
+            }}
           >
             <ZoomIn size={16} />
+          </button>
+          <button
+            id="btn-zoom-fit-width"
+            type="button"
+            class={`btn-secondary ${fitWidthMode ? 'active' : ''}`}
+            title="Zoom to fit page width (with side margins)"
+            aria-label="Fit Width"
+            aria-pressed={fitWidthMode}
+            style={{
+              padding: '4px 8px',
+              fontSize: '11.5px',
+              ...(fitWidthMode
+                ? {
+                    background: 'var(--accent)',
+                    color: '#ffffff',
+                    borderColor: 'var(--accent)',
+                  }
+                : {}),
+            }}
+            onClick={toggleFitWidth}
+          >
+            Fit
           </button>
 
           <button
@@ -1654,95 +1971,97 @@ export function NoteEditor({
           id="stage-scroller"
           class={`stage-scroller dir-${note.scrollDirection}`}
         >
-          {note.pages.map((page, idx) => {
-            const isVisible = Math.abs(idx - activePageIndex) <= 2;
-            return (
-              <PageSlot
-                key={page.pageId}
-                page={page}
-                pageIndex={idx}
-                zoom={zoom}
-                isVisible={isVisible}
-                activeTool={effectiveTool}
-                fingerDrawMode={settings.fingerDrawMode}
-                strokes={note.strokesByPage[page.pageId] ?? EMPTY_STROKES}
-                textBoxes={note.textBoxesByPage[page.pageId] ?? EMPTY_TEXTBOXES}
-                images={note.imagesByPage[page.pageId] ?? EMPTY_IMAGES}
-                hiddenStrokeIds={page.pageId === lassoPageId ? hiddenStrokeIds : EMPTY_HIDDEN_IDS}
-                selectedTextBoxId={selectedTextBoxId}
-                selectedImageId={selectedImageId}
-                replaySessionId={isPlaying ? playbackSessionId : null}
-                replayTimeMs={playbackTimeMs}
-                onPointerDown={handlePointerDown}
-                onPointerMove={handlePointerMove}
-                onPointerUp={handlePointerUp}
-                onSelectTextBox={setSelectedTextBoxId}
-                onUpdateTextBox={(pid, box) => {
-                  const prev = noteRef.current.textBoxesByPage[pid] ?? [];
-                  onUpdateNote({
-                    ...noteRef.current,
-                    updatedAt: Date.now(),
-                    textBoxesByPage: {
-                      ...noteRef.current.textBoxesByPage,
-                      [pid]: prev.map((b) => (b.id === box.id ? box : b)),
-                    },
-                  });
-                }}
-                onDeleteTextBox={(pid, id) => {
-                  const prev = noteRef.current.textBoxesByPage[pid] ?? [];
-                  onUpdateNote({
-                    ...noteRef.current,
-                    updatedAt: Date.now(),
-                    textBoxesByPage: {
-                      ...noteRef.current.textBoxesByPage,
-                      [pid]: prev.filter((b) => b.id !== id),
-                    },
-                  });
-                  setSelectedTextBoxId(null);
-                }}
-                onSelectImage={setSelectedImageId}
-                onUpdateImage={(pid, img) => {
-                  const prev = noteRef.current.imagesByPage[pid] ?? [];
-                  onUpdateNote({
-                    ...noteRef.current,
-                    updatedAt: Date.now(),
-                    imagesByPage: {
-                      ...noteRef.current.imagesByPage,
-                      [pid]: prev.map((i) => (i.id === img.id ? img : i)),
-                    },
-                  });
-                }}
-                onDeleteImage={(pid, id) => {
-                  const prev = noteRef.current.imagesByPage[pid] ?? [];
-                  onUpdateNote({
-                    ...noteRef.current,
-                    updatedAt: Date.now(),
-                    imagesByPage: {
-                      ...noteRef.current.imagesByPage,
-                      [pid]: prev.filter((i) => i.id !== id),
-                    },
-                  });
-                  setSelectedImageId(null);
-                }}
-                onJumpToPdfPage={(pdfPageNum) => {
-                  const targetIdx = note.pages.findIndex(
-                    (p) => p.source.kind === 'pdf' && p.source.pdfPageNumber === pdfPageNum
-                  );
-                  if (targetIdx >= 0) {
-                    const slot = scrollerRef.current?.querySelector<HTMLElement>(
-                      `[data-page-index="${targetIdx}"]`
+          <div ref={pagesTrackRef} class={`stage-pages-track dir-${note.scrollDirection}`}>
+            {note.pages.map((page, idx) => {
+              const isVisible = Math.abs(idx - activePageIndex) <= 2;
+              return (
+                <PageSlot
+                  key={page.pageId}
+                  page={page}
+                  pageIndex={idx}
+                  zoom={zoom}
+                  isVisible={isVisible}
+                  activeTool={effectiveTool}
+                  fingerDrawMode={settings.fingerDrawMode}
+                  strokes={note.strokesByPage[page.pageId] ?? EMPTY_STROKES}
+                  textBoxes={note.textBoxesByPage[page.pageId] ?? EMPTY_TEXTBOXES}
+                  images={note.imagesByPage[page.pageId] ?? EMPTY_IMAGES}
+                  hiddenStrokeIds={page.pageId === lassoPageId ? hiddenStrokeIds : EMPTY_HIDDEN_IDS}
+                  selectedTextBoxId={selectedTextBoxId}
+                  selectedImageId={selectedImageId}
+                  replaySessionId={isPlaying ? playbackSessionId : null}
+                  replayTimeMs={playbackTimeMs}
+                  onPointerDown={handlePointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerUp={handlePointerUp}
+                  onSelectTextBox={setSelectedTextBoxId}
+                  onUpdateTextBox={(pid, box) => {
+                    const prev = noteRef.current.textBoxesByPage[pid] ?? [];
+                    onUpdateNote({
+                      ...noteRef.current,
+                      updatedAt: Date.now(),
+                      textBoxesByPage: {
+                        ...noteRef.current.textBoxesByPage,
+                        [pid]: prev.map((b) => (b.id === box.id ? box : b)),
+                      },
+                    });
+                  }}
+                  onDeleteTextBox={(pid, id) => {
+                    const prev = noteRef.current.textBoxesByPage[pid] ?? [];
+                    onUpdateNote({
+                      ...noteRef.current,
+                      updatedAt: Date.now(),
+                      textBoxesByPage: {
+                        ...noteRef.current.textBoxesByPage,
+                        [pid]: prev.filter((b) => b.id !== id),
+                      },
+                    });
+                    setSelectedTextBoxId(null);
+                  }}
+                  onSelectImage={setSelectedImageId}
+                  onUpdateImage={(pid, img) => {
+                    const prev = noteRef.current.imagesByPage[pid] ?? [];
+                    onUpdateNote({
+                      ...noteRef.current,
+                      updatedAt: Date.now(),
+                      imagesByPage: {
+                        ...noteRef.current.imagesByPage,
+                        [pid]: prev.map((i) => (i.id === img.id ? img : i)),
+                      },
+                    });
+                  }}
+                  onDeleteImage={(pid, id) => {
+                    const prev = noteRef.current.imagesByPage[pid] ?? [];
+                    onUpdateNote({
+                      ...noteRef.current,
+                      updatedAt: Date.now(),
+                      imagesByPage: {
+                        ...noteRef.current.imagesByPage,
+                        [pid]: prev.filter((i) => i.id !== id),
+                      },
+                    });
+                    setSelectedImageId(null);
+                  }}
+                  onJumpToPdfPage={(pdfPageNum) => {
+                    const targetIdx = note.pages.findIndex(
+                      (p) => p.source.kind === 'pdf' && p.source.pdfPageNumber === pdfPageNum
                     );
-                    slot?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                  }
-                }}
-                onDropFile={(file, pid, xPt, yPt) => {
-                  if (file.type.startsWith('image/')) {
-                    void handleInsertImageFile(file, pid, xPt, yPt);
-                  }
-                }}
-              />
-            );
-          })}
+                    if (targetIdx >= 0) {
+                      const slot = scrollerRef.current?.querySelector<HTMLElement>(
+                        `[data-page-index="${targetIdx}"]`
+                      );
+                      slot?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                  }}
+                  onDropFile={(file, pid, xPt, yPt) => {
+                    if (file.type.startsWith('image/')) {
+                      void handleInsertImageFile(file, pid, xPt, yPt);
+                    }
+                  }}
+                />
+              );
+            })}
+          </div>
         </div>
       </div>
 

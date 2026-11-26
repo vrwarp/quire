@@ -159,7 +159,11 @@ export function PageSlot({
     }
     let cancelled = false;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const renderScale = Math.max(1, zoom * dpr);
+    const maxScaleForPage = Math.min(
+      2400 / Math.max(1, page.widthPt),
+      2400 / Math.max(1, page.heightPt)
+    );
+    const renderScale = Math.max(1, Math.min(zoom * dpr, maxScaleForPage));
     const { blobKey, pdfPageNumber, rotation } = page.source;
 
     void pdfEngine.renderPageTile(blobKey, pdfPageNumber, renderScale, rotation).then((bitmap) => {
@@ -175,7 +179,7 @@ export function PageSlot({
     return () => {
       cancelled = true;
     };
-  }, [isVisible, page.source, zoom, compositePdfWithHighlighters]);
+  }, [isVisible, page.source, page.widthPt, page.heightPt, zoom, compositePdfWithHighlighters]);
 
   // Synchronously commit Dry Highlighter + Dry Pen updates BEFORE the next browser paint frame
   // (avoids Preact useEffect's rAF + setTimeout 2-frame blink and skips untouched layers in O(1))
@@ -186,7 +190,11 @@ export function PageSlot({
       return;
     }
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const scale = zoom * dpr;
+    const maxScaleForPage = Math.min(
+      2400 / Math.max(1, page.widthPt),
+      2400 / Math.max(1, page.heightPt)
+    );
+    const scale = Math.min(zoom * dpr, maxScaleForPage);
 
     if (hlCanvasRef.current) {
       const prevHl = prevHlStateRef.current;
@@ -352,6 +360,7 @@ export function PageSlot({
       style={{
         width: `${scaledW}px`,
         height: `${scaledH}px`,
+        '--page-zoom': zoom,
       }}
       onPointerDown={(e) => slotRef.current && onPointerDown(e as unknown as PointerEvent, page, slotRef.current)}
       onPointerMove={(e) => slotRef.current && onPointerMove(e as unknown as PointerEvent, page, slotRef.current)}
