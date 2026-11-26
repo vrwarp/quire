@@ -28,6 +28,7 @@ export type InkWorkerMessage =
     }
   | {
       type: 'wet-start';
+      seq: number;
       tool: 'pen' | 'highlighter';
       color: string;
       width: number;
@@ -39,6 +40,7 @@ export type InkWorkerMessage =
     }
   | {
       type: 'wet-append';
+      seq: number;
       offsetX: number;
       offsetY: number;
       zoom: number;
@@ -46,7 +48,15 @@ export type InkWorkerMessage =
       predicted: StrokePoint[];
     }
   | {
+      type: 'wet-trim';
+      seq: number;
+      offsetX: number;
+      offsetY: number;
+      zoom: number;
+    }
+  | {
       type: 'wet-replace';
+      seq: number;
       tool: 'pen' | 'highlighter';
       color: string;
       width: number;
@@ -79,7 +89,7 @@ export type InkWorkerMessage =
       paperTheme: PaperTheme;
       activeStrokes: Array<{ stroke: VectorStroke; elapsedDtMs: number }>;
     }
-  | { type: 'clear' };
+  | { type: 'clear'; seq?: number };
 
 interface DirtyRect {
   x: number;
@@ -95,6 +105,7 @@ let cssWidth = 1;
 let cssHeight = 1;
 
 // Active Wet Stroke State
+let activeSeq = 0;
 let wetTool: 'pen' | 'highlighter' = 'pen';
 let wetColor = '#18181b';
 let wetWidth = 2.8;
@@ -256,6 +267,8 @@ self.onmessage = (event: MessageEvent<InkWorkerMessage>) => {
   if (!ctx || !canvas) return;
 
   if (msg.type === 'clear') {
+    // Ignore delayed post-commit clear if a newer wet stroke has already started
+    if (msg.seq !== undefined && msg.seq !== activeSeq) return;
     clearPreviousDirty();
     wetPoints = [];
     wetMinX = Infinity;
@@ -266,6 +279,7 @@ self.onmessage = (event: MessageEvent<InkWorkerMessage>) => {
   }
 
   if (msg.type === 'wet-start') {
+    activeSeq = msg.seq;
     clearPreviousDirty();
     wetTool = msg.tool;
     wetColor = msg.color;
@@ -281,7 +295,7 @@ self.onmessage = (event: MessageEvent<InkWorkerMessage>) => {
   }
 
   if (msg.type === 'wet-append') {
-    if (wetPoints.length === 0) return;
+    if (msg.seq !== activeSeq || wetPoints.length === 0) return;
     for (let i = 0; i < msg.newPoints.length; i++) {
       const p = msg.newPoints[i];
       wetPoints.push(p);
@@ -291,7 +305,14 @@ self.onmessage = (event: MessageEvent<InkWorkerMessage>) => {
     return;
   }
 
+  if (msg.type === 'wet-trim') {
+    if (msg.seq !== activeSeq || wetPoints.length === 0) return;
+    renderWetFrame(msg.offsetX, msg.offsetY, msg.zoom, []);
+    return;
+  }
+
   if (msg.type === 'wet-replace') {
+    if (msg.seq !== activeSeq) return;
     wetTool = msg.tool;
     wetColor = msg.color;
     wetWidth = msg.width;

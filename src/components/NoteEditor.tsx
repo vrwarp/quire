@@ -63,6 +63,11 @@ import { pdfEngine } from '../engine/pdfEngine';
 import type { InkWorkerMessage } from '../workers/ink.worker';
 import { PageSlot } from './PageSlot';
 
+const EMPTY_STROKES: VectorStroke[] = [];
+const EMPTY_TEXTBOXES: TextBoxItem[] = [];
+const EMPTY_IMAGES: ImageItem[] = [];
+const EMPTY_HIDDEN_IDS = new Set<string>();
+
 interface NoteEditorProps {
   note: NoteDocument;
   settings: AppSettings;
@@ -92,9 +97,12 @@ export function NoteEditor({
   const scrollerRef = useRef<HTMLDivElement>(null);
   const wetCanvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const hzPillRef = useRef<HTMLSpanElement>(null);
+  const hzLatencySpanRef = useRef<HTMLSpanElement>(null);
 
   const workerRef = useRef<Worker | null>(null);
   const fallbackWetCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const wetSeqRef = useRef(0);
   const governorRef = useRef<ProMotionGovernor | null>(null);
   const palmGuardRef = useRef(new PalmRejectionGuard(250));
   // High-cutoff micro-filter used ONLY for coarse mouse/finger; Apple Pencil uses 0ms raw 240Hz coords
@@ -150,7 +158,7 @@ export function NoteEditor({
   const [playbackRate, setPlaybackRate] = useState(1.0);
   const [audioBarOpen, setAudioBarOpen] = useState(note.audioSessions.length > 0);
 
-  // Live 120 Hz Telemetry
+  // Live 120 Hz Telemetry (mounted once; hot-path latency & boost updates mutate DOM refs directly)
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot>({
     boostActive: false,
     offscreenCanvasActive: false,
@@ -163,6 +171,7 @@ export function NoteEditor({
 
   // Active in-progress drawing state (kept in refs with cached geometry so pointermove does 0 DOM reflows!)
   const activeStrokeRef = useRef<{
+    seq: number;
     pointerId: number;
     pointerType: string;
     page: PageDescriptor;
@@ -188,7 +197,10 @@ export function NoteEditor({
   const noteRef = useRef(note);
   noteRef.current = note;
 
-  const hiddenStrokeIds = useMemo(() => new Set(lassoStrokeIds), [lassoStrokeIds]);
+  const hiddenStrokeIds = useMemo(
+    () => (lassoStrokeIds.length === 0 ? EMPTY_HIDDEN_IDS : new Set(lassoStrokeIds)),
+    [lassoStrokeIds]
+  );
 
   const sendToWetWorker = useCallback((msg: InkWorkerMessage) => {
     if (workerRef.current) {
@@ -201,10 +213,16 @@ export function NoteEditor({
     if (!ctx || !canvas) return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     if (msg.type === 'clear') {
+      if (msg.seq !== undefined && msg.seq !== wetSeqRef.current) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-    } else if (msg.type === 'wet-start' || msg.type === 'wet-append' || msg.type === 'wet-replace') {
+    } else if (
+      msg.type === 'wet-start' ||
+      msg.type === 'wet-append' ||
+      msg.type === 'wet-trim' ||
+      msg.type === 'wet-replace'
+    ) {
       const cur = activeStrokeRef.current;
-      if (!cur) return;
+      if (!cur || msg.seq !== cur.seq) return;
       const pts =
         msg.type === 'wet-append' ? [...cur.points, ...msg.predicted] : cur.points;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -230,12 +248,9 @@ export function NoteEditor({
 
     const governor = new ProMotionGovernor(wrapper, {
       holdMs: 850,
-      onStatusChange: (active) =>
-        setTelemetry((prev) => ({
-          ...prev,
-          boostActive: active,
-          estimatedHz: active ? 120 : 60,
-        })),
+      onStatusChange: (active) => {
+        hzPillRef.current?.classList.toggle('boosted', active);
+      },
     });
     governorRef.current = governor;
 
@@ -261,11 +276,14 @@ export function NoteEditor({
               rendererBackend: ev.data.backend,
             }));
           } else if (ev.data?.type === 'telemetry') {
-            setTelemetry((prev) => ({
-              ...prev,
-              lastInkLatencyMs: ev.data.renderMs,
-              cachedPdfTiles: pdfEngine.cachedTileCount,
-            }));
+            // Update latency badge via direct DOM ref so active 120 Hz strokes cause ZERO Preact VDOM re-renders!
+            if (hzLatencySpanRef.current) {
+              hzLatencySpanRef.current.textContent =
+                ev.data.renderMs > 0 ? ` · ${ev.data.renderMs}ms` : '';
+            }
+            if (hzPillRef.current) {
+              hzPillRef.current.title = `Backend: 2d-offscreen | Ink GPU pass: ${ev.data.renderMs}ms | Cached PDF tiles: ${pdfEngine.cachedTileCount}`;
+            }
           }
         };
         worker.postMessage(
@@ -585,6 +603,7 @@ export function NoteEditor({
       applyEraserAt(page.pageId, xPt, yPt);
       const nowPerf = e.timeStamp || performance.now();
       activeStrokeRef.current = {
+        seq: 0,
         pointerId: e.pointerId,
         pointerType: e.pointerType,
         page,
@@ -659,7 +678,10 @@ export function NoteEditor({
     const startAudioMs =
       recordingState === 'recording' ? audioRecorderRef.current?.getElapsedMs() : undefined;
 
+    const seq = ++wetSeqRef.current;
+
     activeStrokeRef.current = {
+      seq,
       pointerId: e.pointerId,
       pointerType: e.pointerType,
       page,
@@ -684,6 +706,7 @@ export function NoteEditor({
     // Dispatch wet-start immediately (<0.1ms) so initial pen-down dot renders on the very next 120 Hz scanout!
     sendToWetWorker({
       type: 'wet-start',
+      seq,
       tool: inkTool,
       color,
       width,
@@ -814,6 +837,7 @@ export function NoteEditor({
     // Stream ONLY O(1) delta points + transient predicted tip to 2D OffscreenCanvas worker!
     sendToWetWorker({
       type: 'wet-append',
+      seq: active.seq,
       offsetX: active.offsetX,
       offsetY: active.offsetY,
       zoom,
@@ -834,6 +858,7 @@ export function NoteEditor({
           cur.snappedKind = recognized.kind;
           sendToWetWorker({
             type: 'wet-replace',
+            seq: cur.seq,
             tool: cur.tool,
             color: cur.color,
             width: cur.width,
@@ -880,6 +905,7 @@ export function NoteEditor({
           lassoDragRef.current.dy = 0;
           lassoDragRef.current.scale = 1;
         }
+        wetSeqRef.current += 1;
         sendToWetWorker({ type: 'clear' });
         return;
       }
@@ -912,6 +938,7 @@ export function NoteEditor({
           });
         } else {
           setLassoPolygon([]);
+          wetSeqRef.current += 1;
           sendToWetWorker({ type: 'clear' });
         }
       }
@@ -921,12 +948,15 @@ export function NoteEditor({
     const active = activeStrokeRef.current;
     if (!active || active.pointerId !== e.pointerId) return;
     window.clearTimeout(active.dwellTimer);
-    activeStrokeRef.current = null;
 
-    if (active.color === 'eraser') return;
+    if (active.color === 'eraser') {
+      activeStrokeRef.current = null;
+      return;
+    }
 
     // Optional Scribble-Scratch Quick Erase (WebKit double-tap alternative)
     if (settings.scribbleEraseEnabled && active.tool === 'pen' && isScribbleEraseGesture(active.points)) {
+      activeStrokeRef.current = null;
       const scribbleBox = computeBBox(active.points, 6);
       mutatePageStrokes(
         page.pageId,
@@ -940,10 +970,23 @@ export function NoteEditor({
           ),
         'Scribble erase'
       );
+      wetSeqRef.current += 1;
       sendToWetWorker({ type: 'clear' });
       onToast('Scribble-erased ink');
       return;
     }
+
+    // Trim transient lookahead tip / snap badge on the Wet surface while keeping the exact stroke
+    // visible until WebKit's next Page::updateRendering() -> CommitLayerTree presents the Dry layer!
+    const finishedSeq = active.seq;
+    sendToWetWorker({
+      type: 'wet-trim',
+      seq: finishedSeq,
+      offsetX: active.offsetX,
+      offsetY: active.offsetY,
+      zoom,
+    });
+    activeStrokeRef.current = null;
 
     const endAudioMs =
       active.audioSessionId && recordingState === 'recording'
@@ -967,7 +1010,13 @@ export function NoteEditor({
     };
 
     mutatePageStrokes(page.pageId, (prev) => [...prev, committed], 'Add stroke');
-    sendToWetWorker({ type: 'clear' });
+
+    // Clear Wet OffscreenCanvas in a post-rAF macrotask strictly AFTER WebKit flushes the Dry CommitLayerTree
+    window.requestAnimationFrame(() => {
+      window.setTimeout(() => {
+        sendToWetWorker({ type: 'clear', seq: finishedSeq });
+      }, 0);
+    });
   };
 
   const applyEraserAt = (pageId: string, xPt: number, yPt: number) => {
@@ -1003,9 +1052,13 @@ export function NoteEditor({
      Lasso Batch Actions (Recolor / Scale / Duplicate / Delete)
      ============================================================================ */
   const clearLasso = () => {
-    setLassoStrokeIds([]);
-    setLassoPolygon([]);
+    if (lassoStrokeIds.length === 0 && lassoPolygon.length === 0 && lassoPageId === null) {
+      return;
+    }
+    setLassoStrokeIds((prev) => (prev.length === 0 ? prev : []));
+    setLassoPolygon((prev) => (prev.length === 0 ? prev : []));
     setLassoPageId(null);
+    wetSeqRef.current += 1;
     sendToWetWorker({ type: 'clear' });
   };
 
@@ -1295,9 +1348,10 @@ export function NoteEditor({
 
         <div class="editor-header-right">
           <span
+            ref={hzPillRef}
             id="telemetry-hz-pill"
             class={`hz-pill ${telemetry.boostActive ? 'boosted' : ''}`}
-            title={`Backend: ${telemetry.rendererBackend} | Ink GPU pass: ${telemetry.lastInkLatencyMs}ms | Prediction: ${settings.predictionLookaheadMs}ms | Cached PDF tiles: ${telemetry.cachedPdfTiles}`}
+            title={`Backend: ${telemetry.rendererBackend} | Prediction: ${settings.predictionLookaheadMs}ms`}
           >
             <span class="hz-dot" />
             {telemetry.offscreenCanvasActive
@@ -1305,7 +1359,7 @@ export function NoteEditor({
                 ? '120Hz WebGL2'
                 : '120Hz Offscreen'
               : 'Canvas'}
-            {telemetry.lastInkLatencyMs > 0 ? ` · ${telemetry.lastInkLatencyMs}ms` : ''}
+            <span ref={hzLatencySpanRef} />
           </span>
 
           <button
@@ -1611,10 +1665,10 @@ export function NoteEditor({
                 isVisible={isVisible}
                 activeTool={effectiveTool}
                 fingerDrawMode={settings.fingerDrawMode}
-                strokes={note.strokesByPage[page.pageId] ?? []}
-                textBoxes={note.textBoxesByPage[page.pageId] ?? []}
-                images={note.imagesByPage[page.pageId] ?? []}
-                hiddenStrokeIds={page.pageId === lassoPageId ? hiddenStrokeIds : new Set()}
+                strokes={note.strokesByPage[page.pageId] ?? EMPTY_STROKES}
+                textBoxes={note.textBoxesByPage[page.pageId] ?? EMPTY_TEXTBOXES}
+                images={note.imagesByPage[page.pageId] ?? EMPTY_IMAGES}
+                hiddenStrokeIds={page.pageId === lassoPageId ? hiddenStrokeIds : EMPTY_HIDDEN_IDS}
                 selectedTextBoxId={selectedTextBoxId}
                 selectedImageId={selectedImageId}
                 replaySessionId={isPlaying ? playbackSessionId : null}

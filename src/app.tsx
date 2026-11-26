@@ -92,7 +92,40 @@ export function App() {
     void quireStorage.saveSettings(next);
   }, []);
 
-  const persistNote = useCallback((updated: NoteDocument) => {
+  const pendingSavesRef = useRef<Map<string, { note: NoteDocument; timer: number }>>(new Map());
+
+  const flushPendingSaves = useCallback(() => {
+    for (const [id, entry] of pendingSavesRef.current.entries()) {
+      window.clearTimeout(entry.timer);
+      pendingSavesRef.current.delete(id);
+      void quireStorage.saveNote(entry.note);
+    }
+  }, []);
+
+  const cancelPendingSave = useCallback((noteId: string) => {
+    const existing = pendingSavesRef.current.get(noteId);
+    if (existing) {
+      window.clearTimeout(existing.timer);
+      pendingSavesRef.current.delete(noteId);
+    }
+  }, []);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flushPendingSaves();
+    };
+    window.addEventListener('pagehide', flushPendingSaves);
+    window.addEventListener('beforeunload', flushPendingSaves);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      flushPendingSaves();
+      window.removeEventListener('pagehide', flushPendingSaves);
+      window.removeEventListener('beforeunload', flushPendingSaves);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [flushPendingSaves]);
+
+  const persistNote = useCallback((updated: NoteDocument, immediate = false) => {
     const withHlc: NoteDocument = {
       ...updated,
       hlc: tickHLC(updated.hlc),
@@ -101,7 +134,20 @@ export function App() {
       const exists = prev.some((n) => n.id === withHlc.id);
       return exists ? prev.map((n) => (n.id === withHlc.id ? withHlc : n)) : [withHlc, ...prev];
     });
-    void quireStorage.saveNote(withHlc);
+    const prevEntry = pendingSavesRef.current.get(withHlc.id);
+    if (prevEntry) {
+      window.clearTimeout(prevEntry.timer);
+      pendingSavesRef.current.delete(withHlc.id);
+    }
+    if (immediate) {
+      void quireStorage.saveNote(withHlc);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      pendingSavesRef.current.delete(withHlc.id);
+      void quireStorage.saveNote(withHlc);
+    }, 180);
+    pendingSavesRef.current.set(withHlc.id, { note: withHlc, timer });
   }, []);
 
   const activeNotes = useMemo(() => notes.filter((n) => !n.deletedAt), [notes]);
@@ -125,7 +171,7 @@ export function App() {
     };
     updateSettings(nextSettings);
     const firstNote = createNewNote(nextSettings, null);
-    persistNote(firstNote);
+    persistNote(firstNote, true);
     setActiveNoteId(firstNote.id);
     setSidebarCollapsed(true);
   };
@@ -134,7 +180,7 @@ export function App() {
   const handleCreateNote = () => {
     const targetFolder = filter.kind === 'folder' ? filter.folderId : null;
     const fresh = createNewNote(settings, targetFolder);
-    persistNote(fresh);
+    persistNote(fresh, true);
     setActiveNoteId(fresh.id);
     setSidebarCollapsed(true);
   };
@@ -186,7 +232,7 @@ export function App() {
         audioSessions: [],
         hlc: { ts: now, counter: 0, deviceId: 'local' },
       };
-      persistNote(pdfNote);
+      persistNote(pdfNote, true);
       setActiveNoteId(pdfNote.id);
       setSidebarCollapsed(true);
       showToast(`Imported ${result.pageCount}-page PDF "${baseTitle}"`);
@@ -438,7 +484,7 @@ export function App() {
     };
     const { conflictCopy } = mergeNoteVersions(localWithEdit, remoteSimulated);
     if (conflictCopy) {
-      persistNote(conflictCopy);
+      persistNote(conflictCopy, true);
       showToast(`Preserved offline edit as "${conflictCopy.title}"`);
     }
   };
@@ -474,6 +520,7 @@ export function App() {
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
         onSelectFilter={(f) => {
+          flushPendingSaves();
           setFilter(f);
           setActiveNoteId(null);
         }}
@@ -484,7 +531,7 @@ export function App() {
         onMoveNoteToFolder={(noteId, folderId) => {
           const target = notes.find((n) => n.id === noteId);
           if (target) {
-            persistNote({ ...target, folderId, updatedAt: Date.now() });
+            persistNote({ ...target, folderId, updatedAt: Date.now() }, true);
             showToast('Moved note to folder');
           }
         }}
@@ -500,6 +547,7 @@ export function App() {
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
             onBackToLibrary={() => {
+              flushPendingSaves();
               setActiveNoteId(null);
               setSidebarCollapsed(false);
             }}
@@ -624,7 +672,7 @@ export function App() {
                                 class="btn-secondary"
                                 style={{ padding: '4px 8px', fontSize: '12px' }}
                                 onClick={() => {
-                                  persistNote({ ...n, deletedAt: null, updatedAt: Date.now() });
+                                  persistNote({ ...n, deletedAt: null, updatedAt: Date.now() }, true);
                                   showToast(`Restored "${n.title}"`);
                                 }}
                               >
@@ -636,6 +684,7 @@ export function App() {
                                 style={{ color: 'var(--danger)' }}
                                 aria-label={`Permanently delete ${n.title}`}
                                 onClick={() => {
+                                  cancelPendingSave(n.id);
                                   setNotes((prev) => prev.filter((item) => item.id !== n.id));
                                   void quireStorage.hardDeleteNote(n.id);
                                 }}
@@ -649,7 +698,7 @@ export function App() {
                                 type="button"
                                 class={`btn-icon ${n.isFavorite ? 'active' : ''}`}
                                 aria-label={`Favorite ${n.title}`}
-                                onClick={() => persistNote({ ...n, isFavorite: !n.isFavorite })}
+                                onClick={() => persistNote({ ...n, isFavorite: !n.isFavorite }, true)}
                               >
                                 <Star size={15} fill={n.isFavorite ? 'currentColor' : 'none'} />
                               </button>
@@ -658,7 +707,7 @@ export function App() {
                                 class="btn-icon"
                                 aria-label={`Move ${n.title} to Trash`}
                                 onClick={() => {
-                                  persistNote({ ...n, deletedAt: Date.now() });
+                                  persistNote({ ...n, deletedAt: Date.now() }, true);
                                   showToast(`Moved "${n.title}" to Recently Deleted`);
                                 }}
                               >

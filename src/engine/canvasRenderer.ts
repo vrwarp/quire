@@ -119,9 +119,22 @@ export function drawVectorStroke(
   ctx.restore();
 }
 
+let sharedHighlighterScratch: HTMLCanvasElement | null = null;
+
+function getHighlighterScratch(pxW: number, pxH: number): HTMLCanvasElement {
+  if (!sharedHighlighterScratch) {
+    sharedHighlighterScratch = document.createElement('canvas');
+  }
+  if (sharedHighlighterScratch.width !== pxW || sharedHighlighterScratch.height !== pxH) {
+    sharedHighlighterScratch.width = pxW;
+    sharedHighlighterScratch.height = pxH;
+  }
+  return sharedHighlighterScratch;
+}
+
 /**
  * Renders a page's dry Highlighter layer with single-layer non-darkening semantics (FR-INK-02):
- * Each color group is rendered at full alpha into a scratch buffer and composited once at 0.34 alpha,
+ * Each color group is rendered at full alpha into a shared scratch buffer and composited once,
  * so overlapping passes never darken or muddy underlying dark ink / PDF text.
  */
 export function renderDryHighlighterLayer(
@@ -144,7 +157,7 @@ export function renderDryHighlighterLayer(
   ctx.clearRect(0, 0, pxW, pxH);
 
   const highlighters = strokes.filter(
-    (s) => s.tool === 'highlighter' && (!hiddenIds || !hiddenIds.has(s.id))
+    (s) => s.tool === 'highlighter' && (!hiddenIds || hiddenIds.size === 0 || !hiddenIds.has(s.id))
   );
   if (highlighters.length === 0) return;
 
@@ -156,9 +169,7 @@ export function renderDryHighlighterLayer(
     byColor.set(s.color, list);
   }
 
-  const scratch = document.createElement('canvas');
-  scratch.width = pxW;
-  scratch.height = pxH;
+  const scratch = getHighlighterScratch(pxW, pxH);
   const sctx = scratch.getContext('2d');
   if (!sctx) return;
 
@@ -186,6 +197,33 @@ export function renderDryHighlighterLayer(
     ctx.drawImage(scratch, 0, 0);
     ctx.restore();
   }
+}
+
+/**
+ * Appends a single newly committed Pen stroke onto an initialized Dry Pen layer in O(1) time,
+ * avoiding O(N) full-page clearing and Barry-Goldman Catmull-Rom re-tessellation on every pen lift.
+ */
+export function appendDryPenStroke(
+  canvas: HTMLCanvasElement,
+  stroke: VectorStroke,
+  widthPt: number,
+  heightPt: number,
+  scale: number,
+  paperTheme: PaperTheme
+): boolean {
+  if (stroke.tool !== 'pen') return false;
+  const pxW = Math.max(1, Math.round(widthPt * scale));
+  const pxH = Math.max(1, Math.round(heightPt * scale));
+  if (canvas.width !== pxW || canvas.height !== pxH) {
+    return false;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return false;
+  ctx.save();
+  ctx.scale(scale, scale);
+  drawVectorStroke(ctx, stroke, paperTheme);
+  ctx.restore();
+  return true;
 }
 
 /**

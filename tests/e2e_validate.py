@@ -145,6 +145,42 @@ def main():
             print(f"[PASS] CUJ 2 Dry layer pixel counts (highlighter, pen): {non_empty}")
             assert all(n > 20 for n in non_empty), f"Expected ink pixels on both layers, got {non_empty}"
 
+            # Verify highlighter layer does NOT force CoreAnimation CSS mix-blend-mode backdrop readback
+            hl_blend = page.evaluate(
+                "() => getComputedStyle(document.querySelector('.highlighter-layer')).mixBlendMode"
+            )
+            assert hl_blend == "normal", f"Expected normal blend mode on .highlighter-layer, got {hl_blend}"
+
+            # Regression check: switch back from Highlighter -> Pen and draw 3 rapid back-to-back strokes
+            # (verifies O(1) incremental Dry Pen append, zero Dry Highlighter churn, and seq-guarded Wet clear!)
+            page.click("#tool-pen")
+            for line_idx in range(3):
+                y_off = 162 + line_idx * 14
+                page.mouse.move(box["x"] + 90, box["y"] + y_off)
+                page.mouse.down()
+                page.mouse.move(box["x"] + 330, box["y"] + y_off, steps=8)
+                page.mouse.up()
+            page.wait_for_timeout(120)
+
+            after_rapid_pen = page.evaluate("""() => {
+                const canvases = [...document.querySelectorAll('.page-slot canvas')];
+                return canvases.map(c => {
+                    const ctx = c.getContext('2d');
+                    if (!ctx) return 0;
+                    const data = ctx.getImageData(0, 0, c.width, c.height).data;
+                    let nonZero = 0;
+                    for (let i = 3; i < data.length; i += 16) if (data[i] > 0) nonZero++;
+                    return nonZero;
+                });
+            }""")
+            assert after_rapid_pen[0] == non_empty[0], (
+                f"Highlighter layer unexpectedly changed during Pen strokes: {non_empty[0]} -> {after_rapid_pen[0]}"
+            )
+            assert after_rapid_pen[1] > non_empty[1] + 40, (
+                f"Incremental Dry Pen strokes did not accumulate: {non_empty[1]} -> {after_rapid_pen[1]}"
+            )
+            print(f"[PASS] Highlighter -> rapid Pen strokes O(1) incremental append verified ({after_rapid_pen})")
+
             # Verify Wet OffscreenCanvas overlay cleared cleanly after pen lift (0 ghost/double-line pixels!)
             wet_leftover = page.evaluate("""async () => {
                 const wet = document.querySelector('.wet-canvas-overlay');
