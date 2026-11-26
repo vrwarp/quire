@@ -61,10 +61,10 @@ export function App() {
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const toastTimerRef = useRef<number>(0);
 
-  const showToast = useCallback((msg: string) => {
+  const showToast = useCallback((msg: string, durationMs = 3200) => {
     setToast(msg);
     window.clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = window.setTimeout(() => setToast(null), 3200);
+    toastTimerRef.current = window.setTimeout(() => setToast(null), durationMs);
   }, []);
 
   // Hydrate local-first storage immediately on cold launch
@@ -552,6 +552,7 @@ export function App() {
               setSidebarCollapsed(false);
             }}
             onUpdateNote={persistNote}
+            onUpdateSettings={updateSettings}
             onOpenPageManager={(idx) => setPageManagerPageIdx(idx)}
             onOpenExport={(idx) => setExportPageIdx(idx)}
             onToast={showToast}

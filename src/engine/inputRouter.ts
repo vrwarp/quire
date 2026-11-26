@@ -121,6 +121,10 @@ export class PalmRejectionGuard {
 
   shouldRejectTouch(e: PointerEvent): boolean {
     if (e.pointerType !== 'touch') return false;
+    return this.isSuppressedNow();
+  }
+
+  isSuppressedNow(): boolean {
     if (this.penActive) return true;
     return performance.now() - this.lastPenUpAt < this.guardWindowMs;
   }
@@ -210,23 +214,38 @@ export function unpackPointerSamples(
 }
 
 /**
- * Multi-finger tap recognizer for 2-finger Undo and 3-finger Redo (CUJ 2).
+ * Multi-finger tap recognizer for 2-finger Undo and 3-finger Redo (CUJ 2),
+ * guarded against Apple Pencil contact and palm-rejection cooldown windows.
  */
 export function attachMultiFingerUndoRedo(
   target: HTMLElement,
-  handlers: { onUndo: () => void; onRedo: () => void }
+  handlers: { onUndo: () => void; onRedo: () => void; shouldSuppress?: () => boolean }
 ): () => void {
   let maxTouches = 0;
   let startAt = 0;
   let movedTooFar = false;
+  let invalidated = false;
   const startPositions = new Map<number, { x: number; y: number }>();
+
+  const hasStylusTouch = (list: TouchList): boolean => {
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i] as Touch & { touchType?: string };
+      if (t.touchType === 'stylus') return true;
+    }
+    return false;
+  };
 
   const onTouchStart = (e: TouchEvent) => {
     if (e.touches.length === 1) {
       startAt = performance.now();
       movedTooFar = false;
+      invalidated = false;
       maxTouches = 1;
       startPositions.clear();
+    }
+    if (handlers.shouldSuppress?.() || hasStylusTouch(e.touches) || hasStylusTouch(e.changedTouches)) {
+      invalidated = true;
+      return;
     }
     maxTouches = Math.max(maxTouches, e.touches.length);
     for (let i = 0; i < e.changedTouches.length; i++) {
@@ -236,6 +255,7 @@ export function attachMultiFingerUndoRedo(
   };
 
   const onTouchMove = (e: TouchEvent) => {
+    if (invalidated) return;
     for (let i = 0; i < e.changedTouches.length; i++) {
       const t = e.changedTouches[i];
       const origin = startPositions.get(t.identifier);
@@ -248,11 +268,12 @@ export function attachMultiFingerUndoRedo(
   const onTouchEnd = (e: TouchEvent) => {
     if (e.touches.length !== 0) return;
     const elapsed = performance.now() - startAt;
-    if (!movedTooFar && elapsed < 260) {
+    if (!invalidated && !movedTooFar && elapsed < 260 && !handlers.shouldSuppress?.()) {
       if (maxTouches === 2) handlers.onUndo();
       else if (maxTouches === 3) handlers.onRedo();
     }
     maxTouches = 0;
+    invalidated = false;
     startPositions.clear();
   };
 

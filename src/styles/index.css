@@ -848,11 +848,12 @@ select:focus-visible {
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
   touch-action: pan-x pan-y;
-  padding: 76px 28px 110px;
+  padding: 80px 36px 45vh;
 }
 
 .stage-scroller.dir-horizontal {
   scroll-snap-type: x mandatory;
+  padding: 80px 35vw 120px 36px;
 }
 
 .stage-pages-track {
@@ -866,6 +867,10 @@ select:focus-visible {
   gap: 24px;
   width: max-content;
   min-width: 100%;
+}
+
+.stage-pages-track.dir-vertical.is-zoomed-in {
+  padding-inline: 18vw;
 }
 
 .stage-pages-track.dir-horizontal {

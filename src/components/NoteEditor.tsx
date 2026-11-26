@@ -27,7 +27,9 @@ import {
 } from 'lucide-preact';
 import type {
   AppSettings,
+  BBox,
   EraserMode,
+  EraserSizePreset,
   ImageItem,
   NoteDocument,
   PageDescriptor,
@@ -45,12 +47,14 @@ import {
   OneEuroFilter,
   StylusKinematicPredictor,
   computeBBox,
+  createSnappedShapeDescriptor,
   generateOrderKey,
   hitTestStroke,
-  isScribbleEraseGesture,
   partialEraseStroke,
   recognizeShape,
   strokeInLasso,
+  updateSnappedShape,
+  type SnappedShapeDescriptor,
 } from '../engine/inkMath';
 import {
   PalmRejectionGuard,
@@ -68,6 +72,11 @@ const EMPTY_STROKES: VectorStroke[] = [];
 const EMPTY_TEXTBOXES: TextBoxItem[] = [];
 const EMPTY_IMAGES: ImageItem[] = [];
 const EMPTY_HIDDEN_IDS = new Set<string>();
+const ERASER_SIZE_PX: Record<EraserSizePreset, number> = {
+  small: 8,
+  medium: 16,
+  large: 30,
+};
 
 interface NoteEditorProps {
   note: NoteDocument;
@@ -76,9 +85,10 @@ interface NoteEditorProps {
   onToggleSidebar: () => void;
   onBackToLibrary: () => void;
   onUpdateNote: (updated: NoteDocument) => void;
+  onUpdateSettings: (next: AppSettings) => void;
   onOpenPageManager: (activePageIndex: number) => void;
   onOpenExport: (activePageIndex: number) => void;
-  onToast: (msg: string) => void;
+  onToast: (msg: string, durationMs?: number) => void;
   jumpToPageRequest: number | null;
   onClearJumpRequest: () => void;
 }
@@ -88,6 +98,7 @@ export function NoteEditor({
   settings,
   onBackToLibrary,
   onUpdateNote,
+  onUpdateSettings,
   onOpenPageManager,
   onOpenExport,
   onToast,
@@ -120,14 +131,15 @@ export function NoteEditor({
   const [tool, setTool] = useState<ToolKind>('pen');
   const [thumbEraserHeld, setThumbEraserHeld] = useState(false);
   const effectiveTool: ToolKind = thumbEraserHeld ? 'eraser' : tool;
+  const lastInkToolRef = useRef<'pen' | 'highlighter'>('pen');
 
-  const [eraserMode, setEraserMode] = useState<EraserMode>('stroke');
+  const [eraserMode, setEraserMode] = useState<EraserMode>('partial');
   const [penColor, setPenColor] = useState(settings.penColorPresets[0]);
   const [hlColor, setHlColor] = useState(settings.highlighterColorPresets[0]);
   const [penWidth, setPenWidth] = useState(2.8);
   const [hlWidth, setHlWidth] = useState(18);
   const [zoom, setZoom] = useState(1);
-  const [fitWidthMode, setFitWidthMode] = useState(false);
+  const [fitWidthMode, setFitWidthMode] = useState(true);
   const [activePageIndex, setActivePageIndex] = useState(0);
   const [selectedTextBoxId, setSelectedTextBoxId] = useState<string | null>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
@@ -140,22 +152,39 @@ export function NoteEditor({
   fitWidthModeRef.current = fitWidthMode;
   const activePageIndexRef = useRef(activePageIndex);
   activePageIndexRef.current = activePageIndex;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   // Lasso state
   const [lassoPageId, setLassoPageId] = useState<string | null>(null);
   const [lassoStrokeIds, setLassoStrokeIds] = useState<string[]>([]);
   const [lassoPolygon, setLassoPolygon] = useState<Array<{ x: number; y: number }>>([]);
+  const lassoBBoxRef = useRef<BBox | null>(null);
   const lassoDragRef = useRef<{
     active: boolean;
+    mode: 'move' | 'resize';
     startX: number;
     startY: number;
     dx: number;
     dy: number;
     scale: number;
-    centerX: number;
-    centerY: number;
+    anchorX: number;
+    anchorY: number;
+    startCornerDist: number;
     pageEl: HTMLDivElement | null;
-  }>({ active: false, startX: 0, startY: 0, dx: 0, dy: 0, scale: 1, centerX: 0, centerY: 0, pageEl: null });
+  }>({
+    active: false,
+    mode: 'move',
+    startX: 0,
+    startY: 0,
+    dx: 0,
+    dy: 0,
+    scale: 1,
+    anchorX: 0,
+    anchorY: 0,
+    startCornerDist: 1,
+    pageEl: null,
+  });
 
   // Audio recording & playback state
   const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'paused'>('idle');
@@ -203,6 +232,7 @@ export function NoteEditor({
     startAudioMs?: number;
     dwellTimer: number;
     snappedKind?: string;
+    snappedShape?: SnappedShapeDescriptor;
   } | null>(null);
 
   const noteRef = useRef(note);
@@ -226,6 +256,21 @@ export function NoteEditor({
     if (msg.type === 'clear') {
       if (msg.seq !== undefined && msg.seq !== wetSeqRef.current) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+    } else if (msg.type === 'eraser-cursor') {
+      const cx = msg.offsetX + msg.x * msg.zoom;
+      const cy = msg.offsetY + msg.y * msg.zoom;
+      const rCss = Math.max(4, msg.radiusPt * msg.zoom);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.beginPath();
+      ctx.arc(cx, cy, rCss, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(200, 90, 50, 0.12)';
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(24, 24, 27, 0.8)';
+      ctx.stroke();
+      ctx.restore();
     } else if (
       msg.type === 'wet-start' ||
       msg.type === 'wet-append' ||
@@ -415,10 +460,21 @@ export function NoteEditor({
       governor.wake();
     };
 
+    const getFitWidthForScroller = () => {
+      const page = noteRef.current.pages[activePageIndexRef.current] ?? noteRef.current.pages[0];
+      const pageW = page?.widthPt ?? 612;
+      const availableW = Math.max(240, scroller.clientWidth - 72);
+      return Math.max(0.5, Math.min(4, Number((availableW / pageW).toFixed(3))));
+    };
+
     const previewPinch = (nextZoomRaw: number, curMidX: number, curMidY: number) => {
       const track = pagesTrackRef.current;
       if (!track || !pinch.active) return;
-      const nextZoom = clampZoom(nextZoomRaw);
+      let nextZoom = clampZoom(nextZoomRaw);
+      const fitZoom = getFitWidthForScroller();
+      if (Math.abs(nextZoom - fitZoom) / fitZoom <= 0.06) {
+        nextZoom = fitZoom;
+      }
       const ratio = nextZoom / pinch.startZoom;
       const tx = curMidX - pinch.baseLeft - ratio * pinch.ax;
       const ty = curMidY - pinch.baseTop - ratio * pinch.ay;
@@ -432,16 +488,20 @@ export function NoteEditor({
     const commitPinch = () => {
       if (!pinch.active) return;
       const track = pagesTrackRef.current;
-      const ratio = pinch.targetZoom / pinch.startZoom;
-      const nextLeft = Math.max(
-        0,
-        pinch.startScrollLeft + pinch.ax * (ratio - 1) - (pinch.curMidX - pinch.startMidX)
-      );
+      const fitZoom = getFitWidthForScroller();
+      const snappedToFit = Math.abs(pinch.targetZoom - fitZoom) / fitZoom <= 0.06;
+      const nextZoom = snappedToFit ? fitZoom : pinch.targetZoom;
+      const ratio = nextZoom / pinch.startZoom;
+      const nextLeft = snappedToFit
+        ? 0
+        : Math.max(
+            0,
+            pinch.startScrollLeft + pinch.ax * (ratio - 1) - (pinch.curMidX - pinch.startMidX)
+          );
       const nextTop = Math.max(
         0,
         pinch.startScrollTop + pinch.ay * (ratio - 1) - (pinch.curMidY - pinch.startMidY)
       );
-      const nextZoom = pinch.targetZoom;
       const changed = Math.abs(nextZoom - pinch.startZoom) > 0.004;
 
       pinch.active = false;
@@ -452,7 +512,7 @@ export function NoteEditor({
         track.style.transform = '';
         track.style.willChange = '';
       }
-      setFitWidthMode(false);
+      setFitWidthMode(snappedToFit);
 
       if (changed) {
         pendingScrollRestoreRef.current = { left: nextLeft, top: nextTop };
@@ -510,6 +570,78 @@ export function NoteEditor({
       window.addEventListener('touchcancel', onPinchTouchEnd, { passive: true });
     };
 
+    // Passive Single-Finger Double-Tap Zoom (toggles Fit Width <-> ~2x anchored on tap point)
+    let tapStartX = 0;
+    let tapStartY = 0;
+    let tapStartAt = 0;
+    let tapValid = false;
+    let lastTapAt = 0;
+    let lastTapX = 0;
+    let lastTapY = 0;
+
+    const onDoubleTapTouchStart = (e: TouchEvent) => {
+      if (
+        e.touches.length !== 1 ||
+        settingsRef.current.fingerDrawMode ||
+        palmGuardRef.current.isSuppressedNow()
+      ) {
+        tapValid = false;
+        return;
+      }
+      const t = e.touches[0] as Touch & { touchType?: string };
+      if (t.touchType === 'stylus') {
+        tapValid = false;
+        return;
+      }
+      const targetEl = e.target as HTMLElement | null;
+      if (targetEl?.closest('button, input, textarea, select, a, .canvas-textbox')) {
+        tapValid = false;
+        return;
+      }
+      tapStartX = t.clientX;
+      tapStartY = t.clientY;
+      tapStartAt = performance.now();
+      tapValid = true;
+    };
+
+    const onDoubleTapTouchEnd = (e: TouchEvent) => {
+      if (!tapValid || e.touches.length !== 0 || e.changedTouches.length !== 1) {
+        tapValid = false;
+        return;
+      }
+      tapValid = false;
+      const t = e.changedTouches[0] as Touch & { touchType?: string };
+      if (t.touchType === 'stylus' || palmGuardRef.current.isSuppressedNow()) return;
+      const now = performance.now();
+      const drift = Math.hypot(t.clientX - tapStartX, t.clientY - tapStartY);
+      if (drift > 12 || now - tapStartAt > 240) return;
+
+      if (now - lastTapAt <= 280 && Math.hypot(t.clientX - lastTapX, t.clientY - lastTapY) <= 32) {
+        lastTapAt = 0;
+        const track = pagesTrackRef.current;
+        if (!track) return;
+        const trackRect = track.getBoundingClientRect();
+        const ax = t.clientX - trackRect.left;
+        const ay = t.clientY - trackRect.top;
+        const curZoom = zoomRef.current;
+        const fitZoom = getFitWidthForScroller();
+        const isNearFit = fitWidthModeRef.current || Math.abs(curZoom - fitZoom) / fitZoom < 0.08;
+        const nextZoom = isNearFit ? clampZoom(fitZoom * 2) : fitZoom;
+        const ratio = nextZoom / curZoom;
+        const nextLeft = isNearFit
+          ? Math.max(0, scroller.scrollLeft + ax * (ratio - 1))
+          : 0;
+        const nextTop = Math.max(0, scroller.scrollTop + ay * (ratio - 1));
+        setFitWidthMode(!isNearFit);
+        pendingScrollRestoreRef.current = { left: nextLeft, top: nextTop };
+        setZoom(nextZoom);
+      } else {
+        lastTapAt = now;
+        lastTapX = t.clientX;
+        lastTapY = t.clientY;
+      }
+    };
+
     type SafariGestureEvent = Event & { scale?: number; clientX?: number; clientY?: number };
     const onGestureStart = (ev: Event) => {
       const e = ev as SafariGestureEvent;
@@ -559,20 +691,25 @@ export function NoteEditor({
     };
 
     scroller.addEventListener('touchstart', onPinchTouchStart, { passive: true });
+    scroller.addEventListener('touchstart', onDoubleTapTouchStart, { passive: true });
+    scroller.addEventListener('touchend', onDoubleTapTouchEnd, { passive: true });
     scroller.addEventListener('gesturestart', onGestureStart, { passive: false });
     scroller.addEventListener('gesturechange', onGestureChange, { passive: false });
     scroller.addEventListener('gestureend', onGestureEnd, { passive: false });
     scroller.addEventListener('wheel', onPinchWheel, { passive: false });
 
     const detachMultiFinger = attachMultiFingerUndoRedo(scroller, {
-      onUndo: () => performUndo(),
-      onRedo: () => performRedo(),
+      onUndo: () => performUndo(true),
+      onRedo: () => performRedo(true),
+      shouldSuppress: () => palmGuardRef.current.isSuppressedNow(),
     });
 
     return () => {
       detachTempTouchPinch();
       window.clearTimeout(pinch.wheelTimer);
       scroller.removeEventListener('touchstart', onPinchTouchStart);
+      scroller.removeEventListener('touchstart', onDoubleTapTouchStart);
+      scroller.removeEventListener('touchend', onDoubleTapTouchEnd);
       scroller.removeEventListener('gesturestart', onGestureStart);
       scroller.removeEventListener('gesturechange', onGestureChange);
       scroller.removeEventListener('gestureend', onGestureEnd);
@@ -589,15 +726,6 @@ export function NoteEditor({
     };
   }, []);
 
-  // Restore scroll anchor synchronously after a pinch-to-zoom commit updates page layout
-  useLayoutEffect(() => {
-    const restore = pendingScrollRestoreRef.current;
-    if (!restore || !scrollerRef.current) return;
-    pendingScrollRestoreRef.current = null;
-    scrollerRef.current.scrollLeft = restore.left;
-    scrollerRef.current.scrollTop = restore.top;
-  }, [zoom]);
-
   const computeFitWidthZoom = useCallback(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return 1;
@@ -607,6 +735,20 @@ export function NoteEditor({
     const availableW = Math.max(240, scroller.clientWidth - horizontalMargin);
     return Math.max(0.5, Math.min(4, Number((availableW / pageW).toFixed(3))));
   }, []);
+
+  // Default every newly opened note synchronously to Fit Width before first paint
+  useLayoutEffect(() => {
+    setZoom(computeFitWidthZoom());
+  }, [computeFitWidthZoom]);
+
+  // Restore scroll anchor synchronously after a pinch-to-zoom or double-tap zoom commit updates page layout
+  useLayoutEffect(() => {
+    const restore = pendingScrollRestoreRef.current;
+    if (!restore || !scrollerRef.current) return;
+    pendingScrollRestoreRef.current = null;
+    scrollerRef.current.scrollLeft = restore.left;
+    scrollerRef.current.scrollTop = restore.top;
+  }, [zoom]);
 
   const toggleFitWidth = useCallback(() => {
     setFitWidthMode((prev) => {
@@ -712,19 +854,27 @@ export function NoteEditor({
     redoStackRef.current = [];
   }, []);
 
-  const performUndo = useCallback(() => {
-    const cmd = undoStackRef.current.pop();
-    if (!cmd) return;
-    cmd.undo();
-    redoStackRef.current.push(cmd);
-  }, []);
+  const performUndo = useCallback(
+    (fromGesture = false) => {
+      const cmd = undoStackRef.current.pop();
+      if (!cmd) return;
+      cmd.undo();
+      redoStackRef.current.push(cmd);
+      if (fromGesture) onToast(`Undo: ${cmd.description}`, 1400);
+    },
+    [onToast]
+  );
 
-  const performRedo = useCallback(() => {
-    const cmd = redoStackRef.current.pop();
-    if (!cmd) return;
-    cmd.redo();
-    undoStackRef.current.push(cmd);
-  }, []);
+  const performRedo = useCallback(
+    (fromGesture = false) => {
+      const cmd = redoStackRef.current.pop();
+      if (!cmd) return;
+      cmd.redo();
+      undoStackRef.current.push(cmd);
+      if (fromGesture) onToast(`Redo: ${cmd.description}`, 1400);
+    },
+    [onToast]
+  );
 
   // Keyboard shortcuts (Cmd+Z / Cmd+Shift+Z)
   useEffect(() => {
@@ -798,6 +948,9 @@ export function NoteEditor({
     const pRect = pageEl.getBoundingClientRect();
     return { offsetX: pRect.left - wrapRect.left, offsetY: pRect.top - wrapRect.top, pRect };
   };
+
+  const getEraserRadiusPt = () =>
+    (ERASER_SIZE_PX[settingsRef.current.eraserSize ?? 'medium'] ?? 16) / zoomRef.current;
 
   /* ============================================================================
      Pointer Input Handling (240 Hz Coalesced + Predicted + Palm Rejection)
@@ -882,9 +1035,19 @@ export function NoteEditor({
 
     pageEl.setPointerCapture?.(e.pointerId);
 
-    // Eraser tool (Whole-Stroke or Analytical Precision Partial Erase)
+    // Eraser tool (Analytical Precision Partial or Whole-Stroke + live 120 Hz cursor ring)
     if (effectiveTool === 'eraser') {
+      const radiusPt = getEraserRadiusPt();
       applyEraserAt(page.pageId, xPt, yPt);
+      sendToWetWorker({
+        type: 'eraser-cursor',
+        offsetX,
+        offsetY,
+        zoom,
+        x: xPt,
+        y: yPt,
+        radiusPt,
+      });
       const nowPerf = e.timeStamp || performance.now();
       activeStrokeRef.current = {
         seq: 0,
@@ -898,7 +1061,7 @@ export function NoteEditor({
         offsetY,
         tool: 'pen',
         color: 'eraser',
-        width: 14,
+        width: radiusPt,
         paperTheme: 'light',
         points: [],
         startPerf: nowPerf,
@@ -909,21 +1072,59 @@ export function NoteEditor({
       return;
     }
 
-    // Lasso tool: either drag existing lifted selection OR draw new selection marquee
+    // Lasso tool: hit-test corner resize handles, inside bbox move, or tap-outside dismiss
     if (effectiveTool === 'lasso') {
-      if (lassoPageId === page.pageId && lassoStrokeIds.length > 0) {
-        lassoDragRef.current = {
-          active: true,
-          startX: xPt,
-          startY: yPt,
-          dx: 0,
-          dy: 0,
-          scale: lassoDragRef.current.scale || 1,
-          centerX: lassoDragRef.current.centerX,
-          centerY: lassoDragRef.current.centerY,
-          pageEl,
-        };
-        return;
+      if (lassoPageId === page.pageId && lassoStrokeIds.length > 0 && lassoBBoxRef.current) {
+        const box = lassoBBoxRef.current;
+        const pad = 6 / Math.max(0.5, zoom);
+        const cornerHitR = 18 / Math.max(0.5, zoom);
+        const corners = [
+          { x: box.minX - pad, y: box.minY - pad, oppX: box.maxX, oppY: box.maxY },
+          { x: box.maxX + pad, y: box.minY - pad, oppX: box.minX, oppY: box.maxY },
+          { x: box.maxX + pad, y: box.maxY + pad, oppX: box.minX, oppY: box.minY },
+          { x: box.minX - pad, y: box.maxY + pad, oppX: box.maxX, oppY: box.minY },
+        ];
+        const hitCorner = corners.find((c) => Math.hypot(xPt - c.x, yPt - c.y) <= cornerHitR);
+        if (hitCorner) {
+          lassoDragRef.current = {
+            active: true,
+            mode: 'resize',
+            startX: xPt,
+            startY: yPt,
+            dx: 0,
+            dy: 0,
+            scale: 1,
+            anchorX: hitCorner.oppX,
+            anchorY: hitCorner.oppY,
+            startCornerDist: Math.max(12, Math.hypot(xPt - hitCorner.oppX, yPt - hitCorner.oppY)),
+            pageEl,
+          };
+          return;
+        }
+        const insidePad = 10 / Math.max(0.5, zoom);
+        if (
+          xPt >= box.minX - insidePad &&
+          xPt <= box.maxX + insidePad &&
+          yPt >= box.minY - insidePad &&
+          yPt <= box.maxY + insidePad
+        ) {
+          lassoDragRef.current = {
+            active: true,
+            mode: 'move',
+            startX: xPt,
+            startY: yPt,
+            dx: 0,
+            dy: 0,
+            scale: 1,
+            anchorX: (box.minX + box.maxX) / 2,
+            anchorY: (box.minY + box.maxY) / 2,
+            startCornerDist: 1,
+            pageEl,
+          };
+          return;
+        }
+        // Tapped outside selection: dismiss cleanly (and allow starting a new marquee if dragged)
+        clearLasso();
       }
       setLassoPageId(page.pageId);
       setLassoStrokeIds([]);
@@ -1005,14 +1206,28 @@ export function NoteEditor({
   const handlePointerMove = (e: PointerEvent, page: PageDescriptor, pageEl: HTMLDivElement) => {
     if (e.pointerType === 'touch' && palmGuardRef.current.shouldRejectTouch(e)) return;
 
-    // Active Lasso marquee or drag
+    // Active Lasso marquee, move, or corner resize
     if (effectiveTool === 'lasso') {
       const { offsetX, offsetY, pRect } = getPageOffsets(pageEl);
       const pt = { x: (e.clientX - pRect.left) / zoom, y: (e.clientY - pRect.top) / zoom };
       const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
       if (lassoDragRef.current.active) {
-        lassoDragRef.current.dx = pt.x - lassoDragRef.current.startX;
-        lassoDragRef.current.dy = pt.y - lassoDragRef.current.startY;
+        if (lassoDragRef.current.mode === 'resize') {
+          const curDist = Math.max(
+            8,
+            Math.hypot(pt.x - lassoDragRef.current.anchorX, pt.y - lassoDragRef.current.anchorY)
+          );
+          lassoDragRef.current.scale = Math.max(
+            0.25,
+            Math.min(4, curDist / lassoDragRef.current.startCornerDist)
+          );
+          lassoDragRef.current.dx = 0;
+          lassoDragRef.current.dy = 0;
+        } else {
+          lassoDragRef.current.dx = pt.x - lassoDragRef.current.startX;
+          lassoDragRef.current.dy = pt.y - lassoDragRef.current.startY;
+          lassoDragRef.current.scale = 1;
+        }
         const lifted = (noteRef.current.strokesByPage[page.pageId] ?? []).filter((s) =>
           lassoStrokeIds.includes(s.id)
         );
@@ -1023,12 +1238,13 @@ export function NoteEditor({
           zoom,
           paperTheme,
           polygon: lassoPolygon,
+          bbox: lassoBBoxRef.current,
           liftedStrokes: lifted,
           dx: lassoDragRef.current.dx,
           dy: lassoDragRef.current.dy,
           scale: lassoDragRef.current.scale,
-          centerX: lassoDragRef.current.centerX,
-          centerY: lassoDragRef.current.centerY,
+          anchorX: lassoDragRef.current.anchorX,
+          anchorY: lassoDragRef.current.anchorY,
         });
         return;
       }
@@ -1042,12 +1258,13 @@ export function NoteEditor({
           zoom,
           paperTheme,
           polygon: nextPoly,
+          bbox: null,
           liftedStrokes: [],
           dx: 0,
           dy: 0,
           scale: 1,
-          centerX: 0,
-          centerY: 0,
+          anchorX: 0,
+          anchorY: 0,
         });
       }
       return;
@@ -1063,10 +1280,39 @@ export function NoteEditor({
       y: (cy - active.pageTop) / zoom,
     });
 
-    // Active Eraser sweep
+    // Active Eraser sweep + live 120 Hz circular cursor ring
     if (active.color === 'eraser') {
       const pt = toPageCoords(e.clientX, e.clientY);
       applyEraserAt(page.pageId, pt.x, pt.y);
+      sendToWetWorker({
+        type: 'eraser-cursor',
+        offsetX: active.offsetX,
+        offsetY: active.offsetY,
+        zoom,
+        x: pt.x,
+        y: pt.y,
+        radiusPt: getEraserRadiusPt(),
+      });
+      return;
+    }
+
+    // Post-snap dynamic shape adjustment: stretch/rotate/scale snapped shape live before pen lift!
+    if (active.snappedShape) {
+      const pt = toPageCoords(e.clientX, e.clientY);
+      active.points = updateSnappedShape(active.snappedShape, pt.x, pt.y);
+      sendToWetWorker({
+        type: 'wet-replace',
+        seq: active.seq,
+        tool: active.tool,
+        color: active.color,
+        width: active.width,
+        paperTheme: active.paperTheme,
+        offsetX: active.offsetX,
+        offsetY: active.offsetY,
+        zoom,
+        points: active.points,
+        snapBadge: `Snapped: ${active.snappedShape.kind}`,
+      });
       return;
     }
 
@@ -1110,13 +1356,11 @@ export function NoteEditor({
 
     // Compute 2nd-order curvature-damped kinematic predicted tip (solves WebKit Bug 284852 + pipeline lag!)
     const lastCommitted = active.points[active.points.length - 1];
-    const predictedTip = active.snappedKind
-      ? []
-      : predictorRef.current.predict(
-          lastCommitted,
-          nativePredicted,
-          settings.predictionLookaheadMs ?? 10
-        );
+    const predictedTip = predictorRef.current.predict(
+      lastCommitted,
+      nativePredicted,
+      settings.predictionLookaheadMs ?? 10
+    );
 
     // Stream ONLY O(1) delta points + transient predicted tip to 2D OffscreenCanvas worker!
     sendToWetWorker({
@@ -1132,12 +1376,17 @@ export function NoteEditor({
     // Reset 400ms Hold-to-Snap shape dwell timer whenever stylus moves
     if (movedDist > 2.2) {
       window.clearTimeout(active.dwellTimer);
-      active.snappedKind = undefined;
       active.dwellTimer = window.setTimeout(() => {
         const cur = activeStrokeRef.current;
-        if (!cur || cur.points.length < 5) return;
+        if (!cur || cur.points.length < 5 || cur.snappedShape) return;
         const recognized = recognizeShape(cur.points);
-        if (recognized) {
+        if (recognized && recognized.kind !== 'freehand') {
+          const rawTip = cur.points[cur.points.length - 1];
+          cur.snappedShape = createSnappedShapeDescriptor(
+            recognized.kind,
+            recognized.snappedPoints,
+            rawTip
+          );
           cur.points = recognized.snappedPoints;
           cur.snappedKind = recognized.kind;
           sendToWetWorker({
@@ -1163,34 +1412,58 @@ export function NoteEditor({
       palmGuardRef.current.notePenUp();
     }
 
-    // Finish Lasso selection or commit Lasso move
+    // Finish Lasso selection or commit Lasso move/resize
     if (effectiveTool === 'lasso') {
       if (lassoDragRef.current.active) {
-        const { dx, dy, scale, centerX, centerY } = lassoDragRef.current;
+        const { dx, dy, scale, anchorX, anchorY } = lassoDragRef.current;
         lassoDragRef.current.active = false;
+        const idSet = new Set(lassoStrokeIds);
+        let updatedLifted: VectorStroke[] = (noteRef.current.strokesByPage[page.pageId] ?? []).filter(
+          (s) => idSet.has(s.id)
+        );
         if (Math.abs(dx) > 1 || Math.abs(dy) > 1 || Math.abs(scale - 1) > 0.01) {
-          const idSet = new Set(lassoStrokeIds);
+          updatedLifted = updatedLifted.map((s) => {
+            const pts = s.points.map((p) => ({
+              ...p,
+              x: anchorX + (p.x - anchorX) * scale + dx,
+              y: anchorY + (p.y - anchorY) * scale + dy,
+            }));
+            return { ...s, points: pts, bbox: computeBBox(pts, s.width) };
+          });
+          const updatedMap = new Map(updatedLifted.map((s) => [s.id, s]));
           mutatePageStrokes(
             page.pageId,
-            (prev) =>
-              prev.map((s) => {
-                if (!idSet.has(s.id)) return s;
-                const pts = s.points.map((p) => ({
-                  ...p,
-                  x: centerX + (p.x - centerX) * scale + dx,
-                  y: centerY + (p.y - centerY) * scale + dy,
-                }));
-                return { ...s, points: pts, bbox: computeBBox(pts, s.width) };
-              }),
+            (prev) => prev.map((s) => updatedMap.get(s.id) ?? s),
             'Transform Lasso selection'
           );
-          setLassoPolygon((poly) => poly.map((p) => ({ x: p.x + dx, y: p.y + dy })));
+          const allPts = updatedLifted.flatMap((s) => s.points);
+          if (allPts.length > 0) {
+            const newBox = computeBBox(allPts, 0);
+            lassoBBoxRef.current = newBox;
+            lassoDragRef.current.anchorX = (newBox.minX + newBox.maxX) / 2;
+            lassoDragRef.current.anchorY = (newBox.minY + newBox.maxY) / 2;
+          }
           lassoDragRef.current.dx = 0;
           lassoDragRef.current.dy = 0;
           lassoDragRef.current.scale = 1;
         }
-        wetSeqRef.current += 1;
-        sendToWetWorker({ type: 'clear' });
+        // Keep the lifted selection & bounding box visible until the user taps outside!
+        const { offsetX, offsetY } = getPageOffsets(pageEl);
+        sendToWetWorker({
+          type: 'lasso-overlay',
+          offsetX,
+          offsetY,
+          zoom,
+          paperTheme: page.source.kind === 'template' ? page.source.theme : 'light',
+          polygon: [],
+          bbox: lassoBBoxRef.current,
+          liftedStrokes: updatedLifted,
+          dx: 0,
+          dy: 0,
+          scale: 1,
+          anchorX: lassoDragRef.current.anchorX,
+          anchorY: lassoDragRef.current.anchorY,
+        });
         return;
       }
 
@@ -1201,8 +1474,9 @@ export function NoteEditor({
           const ids = matched.map((s) => s.id);
           const allPts = matched.flatMap((s) => s.points);
           const box = computeBBox(allPts, 0);
-          lassoDragRef.current.centerX = (box.minX + box.maxX) / 2;
-          lassoDragRef.current.centerY = (box.minY + box.maxY) / 2;
+          lassoBBoxRef.current = box;
+          lassoDragRef.current.anchorX = (box.minX + box.maxX) / 2;
+          lassoDragRef.current.anchorY = (box.minY + box.maxY) / 2;
           lassoDragRef.current.scale = 1;
           setLassoStrokeIds(ids);
           const { offsetX, offsetY } = getPageOffsets(pageEl);
@@ -1212,19 +1486,26 @@ export function NoteEditor({
             offsetY,
             zoom,
             paperTheme: page.source.kind === 'template' ? page.source.theme : 'light',
-            polygon: lassoPolygon,
+            polygon: [],
+            bbox: box,
             liftedStrokes: matched,
             dx: 0,
             dy: 0,
             scale: 1,
-            centerX: lassoDragRef.current.centerX,
-            centerY: lassoDragRef.current.centerY,
+            anchorX: lassoDragRef.current.anchorX,
+            anchorY: lassoDragRef.current.anchorY,
           });
         } else {
           setLassoPolygon([]);
+          lassoBBoxRef.current = null;
           wetSeqRef.current += 1;
           sendToWetWorker({ type: 'clear' });
         }
+      } else if (lassoStrokeIds.length === 0 && lassoPolygon.length > 0) {
+        setLassoPolygon([]);
+        lassoBBoxRef.current = null;
+        wetSeqRef.current += 1;
+        sendToWetWorker({ type: 'clear' });
       }
       return;
     }
@@ -1235,28 +1516,11 @@ export function NoteEditor({
 
     if (active.color === 'eraser') {
       activeStrokeRef.current = null;
-      return;
-    }
-
-    // Optional Scribble-Scratch Quick Erase (WebKit double-tap alternative)
-    if (settings.scribbleEraseEnabled && active.tool === 'pen' && isScribbleEraseGesture(active.points)) {
-      activeStrokeRef.current = null;
-      const scribbleBox = computeBBox(active.points, 6);
-      mutatePageStrokes(
-        page.pageId,
-        (prev) =>
-          prev.filter(
-            (s) =>
-              s.bbox.maxX < scribbleBox.minX ||
-              s.bbox.minX > scribbleBox.maxX ||
-              s.bbox.maxY < scribbleBox.minY ||
-              s.bbox.minY > scribbleBox.maxY
-          ),
-        'Scribble erase'
-      );
       wetSeqRef.current += 1;
       sendToWetWorker({ type: 'clear' });
-      onToast('Scribble-erased ink');
+      if (settings.eraserAutoReturn && tool === 'eraser' && !thumbEraserHeld) {
+        setTool(lastInkToolRef.current);
+      }
       return;
     }
 
@@ -1304,7 +1568,7 @@ export function NoteEditor({
   };
 
   const applyEraserAt = (pageId: string, xPt: number, yPt: number) => {
-    const radius = 14 / zoom;
+    const radius = getEraserRadiusPt();
     const strokes = noteRef.current.strokesByPage[pageId] ?? [];
     if (eraserMode === 'stroke') {
       const hit = strokes.some((s) => hitTestStroke(s, xPt, yPt, radius));
@@ -1336,9 +1600,16 @@ export function NoteEditor({
      Lasso Batch Actions (Recolor / Scale / Duplicate / Delete)
      ============================================================================ */
   const clearLasso = () => {
-    if (lassoStrokeIds.length === 0 && lassoPolygon.length === 0 && lassoPageId === null) {
+    if (
+      lassoStrokeIds.length === 0 &&
+      lassoPolygon.length === 0 &&
+      lassoPageId === null &&
+      lassoBBoxRef.current === null
+    ) {
       return;
     }
+    lassoBBoxRef.current = null;
+    lassoDragRef.current.active = false;
     setLassoStrokeIds((prev) => (prev.length === 0 ? prev : []));
     setLassoPolygon((prev) => (prev.length === 0 ? prev : []));
     setLassoPageId(null);
@@ -1360,7 +1631,7 @@ export function NoteEditor({
   const scaleLasso = (factor: number) => {
     if (!lassoPageId || lassoStrokeIds.length === 0) return;
     const idSet = new Set(lassoStrokeIds);
-    const { centerX, centerY } = lassoDragRef.current;
+    const { anchorX, anchorY } = lassoDragRef.current;
     mutatePageStrokes(
       lassoPageId,
       (prev) =>
@@ -1368,8 +1639,8 @@ export function NoteEditor({
           if (!idSet.has(s.id)) return s;
           const pts = s.points.map((p) => ({
             ...p,
-            x: centerX + (p.x - centerX) * factor,
-            y: centerY + (p.y - centerY) * factor,
+            x: anchorX + (p.x - anchorX) * factor,
+            y: anchorY + (p.y - anchorY) * factor,
           }));
           return { ...s, points: pts, bbox: computeBBox(pts, s.width) };
         }),
@@ -1784,6 +2055,7 @@ export function NoteEditor({
           aria-label="Pen Tool"
           onClick={() => {
             clearLasso();
+            lastInkToolRef.current = 'pen';
             setTool('pen');
           }}
         >
@@ -1797,6 +2069,7 @@ export function NoteEditor({
           aria-label="Highlighter Tool"
           onClick={() => {
             clearLasso();
+            lastInkToolRef.current = 'highlighter';
             setTool('highlighter');
           }}
         >
@@ -1859,15 +2132,68 @@ export function NoteEditor({
         <span class="toolbar-divider" />
 
         {effectiveTool === 'eraser' ? (
-          <button
-            id="btn-eraser-mode"
-            type="button"
-            class="btn-secondary"
-            style={{ padding: '4px 8px', fontSize: '11.5px' }}
-            onClick={() => setEraserMode((m) => (m === 'stroke' ? 'partial' : 'stroke'))}
-          >
-            {eraserMode === 'stroke' ? 'Whole' : 'Partial'}
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+            <button
+              id="btn-eraser-mode"
+              type="button"
+              class="btn-secondary"
+              style={{ padding: '4px 8px', fontSize: '11.5px' }}
+              onClick={() => setEraserMode((m) => (m === 'stroke' ? 'partial' : 'stroke'))}
+            >
+              {eraserMode === 'stroke' ? 'Whole' : 'Partial'}
+            </button>
+            {(['small', 'medium', 'large'] as const).map((sz) => {
+              const active = (settings.eraserSize ?? 'medium') === sz;
+              return (
+                <button
+                  key={sz}
+                  id={`btn-eraser-size-${sz}`}
+                  type="button"
+                  class="btn-secondary"
+                  aria-pressed={active}
+                  title={`Eraser size: ${sz}`}
+                  style={{
+                    padding: '4px 7px',
+                    fontSize: '11px',
+                    fontWeight: 600,
+                    ...(active
+                      ? {
+                          background: 'var(--accent)',
+                          color: '#ffffff',
+                          borderColor: 'var(--accent)',
+                        }
+                      : {}),
+                  }}
+                  onClick={() => onUpdateSettings({ ...settings, eraserSize: sz })}
+                >
+                  {sz[0].toUpperCase()}
+                </button>
+              );
+            })}
+            <button
+              id="btn-eraser-auto-return"
+              type="button"
+              class="btn-secondary"
+              aria-pressed={settings.eraserAutoReturn}
+              title="Automatically return to Pen after erasing"
+              style={{
+                padding: '4px 8px',
+                fontSize: '11px',
+                ...(settings.eraserAutoReturn
+                  ? {
+                      background: 'var(--accent)',
+                      color: '#ffffff',
+                      borderColor: 'var(--accent)',
+                    }
+                  : {}),
+              }}
+              onClick={() =>
+                onUpdateSettings({ ...settings, eraserAutoReturn: !settings.eraserAutoReturn })
+              }
+            >
+              Auto-Pen
+            </button>
+          </div>
         ) : (
           <>
             <div class="swatch-row">
@@ -1909,7 +2235,7 @@ export function NoteEditor({
           class="btn-icon"
           title="Undo (Cmd+Z or 2-finger tap)"
           aria-label="Undo"
-          onClick={performUndo}
+          onClick={() => performUndo()}
         >
           <Undo2 size={16} />
         </button>
@@ -1919,7 +2245,7 @@ export function NoteEditor({
           class="btn-icon"
           title="Redo (Cmd+Shift+Z or 3-finger tap)"
           aria-label="Redo"
-          onClick={performRedo}
+          onClick={() => performRedo()}
         >
           <Redo2 size={16} />
         </button>
@@ -1971,7 +2297,12 @@ export function NoteEditor({
           id="stage-scroller"
           class={`stage-scroller dir-${note.scrollDirection}`}
         >
-          <div ref={pagesTrackRef} class={`stage-pages-track dir-${note.scrollDirection}`}>
+          <div
+            ref={pagesTrackRef}
+            class={`stage-pages-track dir-${note.scrollDirection} ${
+              !fitWidthMode && zoom > computeFitWidthZoom() * 1.03 ? 'is-zoomed-in' : ''
+            }`}
+          >
             {note.pages.map((page, idx) => {
               const isVisible = Math.abs(idx - activePageIndex) <= 2;
               return (
