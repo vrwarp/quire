@@ -137,15 +137,31 @@ export function densifyStrokePoints(points: StrokePoint[], subdivisions = 3): St
       continue;
     }
 
-    const t0 = 0;
-    const t1 = i === 0 ? t0 + knotDelta(p1, p2) : t0 + knotDelta(p0, p1);
-    const t2 = t1 + knotDelta(p1, p2);
-    const t3 = i + 2 >= points.length ? t2 + knotDelta(p1, p2) : t2 + knotDelta(p2, p3);
+    const segDx = p2.x - p1.x;
+    const segDy = p2.y - p1.y;
+    const prevLen = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+    const nextLen = Math.hypot(p3.x - p2.x, p3.y - p2.y);
+    const prevDot =
+      i === 0 || prevLen < 1e-4
+        ? -1
+        : ((p1.x - p0.x) * segDx + (p1.y - p0.y) * segDy) / (prevLen * segLen);
+    const nextDot =
+      i + 2 >= points.length || nextLen < 1e-4
+        ? -1
+        : (segDx * (p3.x - p2.x) + segDy * (p3.y - p2.y)) / (segLen * nextLen);
 
-    const p0x = i === 0 ? p1.x - (p2.x - p1.x) : p0.x;
-    const p0y = i === 0 ? p1.y - (p2.y - p1.y) : p0.y;
-    const p3x = i + 2 >= points.length ? p2.x + (p2.x - p1.x) : p3.x;
-    const p3y = i + 2 >= points.length ? p2.y + (p2.y - p1.y) : p3.y;
+    const sharpStart = i === 0 || prevDot < 0.25;
+    const sharpEnd = i + 2 >= points.length || nextDot < 0.25;
+
+    const t0 = 0;
+    const t1 = sharpStart ? t0 + knotDelta(p1, p2) : t0 + knotDelta(p0, p1);
+    const t2 = t1 + knotDelta(p1, p2);
+    const t3 = sharpEnd ? t2 + knotDelta(p1, p2) : t2 + knotDelta(p2, p3);
+
+    const p0x = sharpStart ? p1.x - segDx : p0.x;
+    const p0y = sharpStart ? p1.y - segDy : p0.y;
+    const p3x = sharpEnd ? p2.x + segDx : p3.x;
+    const p3y = sharpEnd ? p2.y + segDy : p3.y;
 
     for (let s = 1; s <= steps; s++) {
       if (s === steps) {
@@ -209,19 +225,60 @@ export function buildStrokeOutline(
   const left: Array<{ x: number; y: number }> = [];
   const right: Array<{ x: number; y: number }> = [];
 
+  const segUnit = (a: StrokePoint, b: StrokePoint): { x: number; y: number } | null => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-4) return null;
+    return { x: dx / len, y: dy / len };
+  };
+
+  let lastValidTangent = { x: 1, y: 0 };
+  for (let i = 0; i < pts.length - 1; i++) {
+    const u = segUnit(pts[i], pts[i + 1]);
+    if (u) {
+      lastValidTangent = u;
+      break;
+    }
+  }
+
   for (let i = 0; i < pts.length; i++) {
-    const prev = pts[Math.max(0, i - 1)];
-    const next = pts[Math.min(pts.length - 1, i + 1)];
-    let dx = next.x - prev.x;
-    let dy = next.y - prev.y;
-    const len = Math.hypot(dx, dy) || 1;
-    dx /= len;
-    dy /= len;
-    const nx = -dy;
-    const ny = dx;
     const hw = strokeHalfWidth(baseWidth, pts[i].pressure, isHighlighter);
-    left.push({ x: pts[i].x + nx * hw, y: pts[i].y + ny * hw });
-    right.push({ x: pts[i].x - nx * hw, y: pts[i].y - ny * hw });
+    const tIn = i > 0 ? segUnit(pts[i - 1], pts[i]) : null;
+    const tOut = i + 1 < pts.length ? segUnit(pts[i], pts[i + 1]) : null;
+    const uIn = tIn ?? tOut ?? lastValidTangent;
+    const uOut = tOut ?? tIn ?? lastValidTangent;
+    lastValidTangent = uOut;
+
+    const nInX = -uIn.y;
+    const nInY = uIn.x;
+    const nOutX = -uOut.y;
+    const nOutY = uOut.x;
+
+    const bx = nInX + nOutX;
+    const by = nInY + nOutY;
+    const bLen = Math.hypot(bx, by);
+
+    if (bLen < 0.25) {
+      // Near-180° hairpin fold-back (e.g. snapped arrow wing): emit rounded cap instead of 0-width pinch
+      left.push(
+        { x: pts[i].x + nInX * hw, y: pts[i].y + nInY * hw },
+        { x: pts[i].x + uIn.x * hw, y: pts[i].y + uIn.y * hw },
+        { x: pts[i].x + nOutX * hw, y: pts[i].y + nOutY * hw }
+      );
+      right.push(
+        { x: pts[i].x - nInX * hw, y: pts[i].y - nInY * hw },
+        { x: pts[i].x + uIn.x * hw, y: pts[i].y + uIn.y * hw },
+        { x: pts[i].x - nOutX * hw, y: pts[i].y - nOutY * hw }
+      );
+    } else {
+      const nx = bx / bLen;
+      const ny = by / bLen;
+      const cosHalf = Math.max(0.65, nx * nOutX + ny * nOutY);
+      const miterHw = hw / cosHalf;
+      left.push({ x: pts[i].x + nx * miterHw, y: pts[i].y + ny * miterHw });
+      right.push({ x: pts[i].x - nx * miterHw, y: pts[i].y - ny * miterHw });
+    }
   }
   return { left, right };
 }
@@ -440,10 +497,22 @@ export function hitTestStroke(stroke: VectorStroke, x: number, y: number, radius
   return false;
 }
 
+function lerpStrokePoint(a: StrokePoint, b: StrokePoint, t: number): StrokePoint {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    pressure: a.pressure + (b.pressure - a.pressure) * t,
+    altitude: a.altitude + (b.altitude - a.altitude) * t,
+    azimuth: a.azimuth + (b.azimuth - a.azimuth) * t,
+    dtMs: Math.round(a.dtMs + (b.dtMs - a.dtMs) * t),
+  };
+}
+
 /**
  * Analytical Precision / Partial Vector Eraser (FR-INK-03).
- * Splits a vector stroke wherever points fall inside the eraser circle, returning 0, 1, or N
- * clean vector child strokes (never using bitmap masks, preserving vector PDF export).
+ * Clips continuous stroke segments against the eraser circle (computing exact ray-circle
+ * entry/exit intersections), returning 0, 1, or N clean vector child strokes even across
+ * long 2-point snapped shafts or fast stylus sweeps.
  */
 export function partialEraseStroke(
   stroke: VectorStroke,
@@ -453,31 +522,95 @@ export function partialEraseStroke(
   makeId: () => string
 ): VectorStroke[] | null {
   if (!hitTestStroke(stroke, cx, cy, radius)) return null;
-  const rSq = (radius + stroke.width * 0.35) ** 2;
+  const r = radius + stroke.width * 0.35;
+  const rSq = r * r;
+  const pts = stroke.points;
+  if (pts.length === 0) return null;
+
+  if (pts.length === 1) {
+    const dx = pts[0].x - cx;
+    const dy = pts[0].y - cy;
+    return dx * dx + dy * dy <= rSq ? [] : null;
+  }
+
   const chunks: StrokePoint[][] = [];
   let current: StrokePoint[] = [];
+  let anyClipped = false;
 
-  for (const pt of stroke.points) {
-    const dx = pt.x - cx;
-    const dy = pt.y - cy;
-    if (dx * dx + dy * dy <= rSq) {
-      if (current.length >= 2) {
+  const flushCurrent = () => {
+    if (current.length >= 2) {
+      const first = current[0];
+      const last = current[current.length - 1];
+      if (current.length > 2 || Math.hypot(last.x - first.x, last.y - first.y) >= 0.4) {
         chunks.push(current);
       }
-      current = [];
-    } else {
-      current.push(pt);
+    }
+    current = [];
+  };
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const pA = pts[i];
+    const pB = pts[i + 1];
+    const dx = pB.x - pA.x;
+    const dy = pB.y - pA.y;
+    const fx = pA.x - cx;
+    const fy = pA.y - cy;
+    const a = dx * dx + dy * dy;
+    const c = fx * fx + fy * fy - rSq;
+
+    if (a < 1e-8) {
+      if (c <= 0) {
+        anyClipped = true;
+        flushCurrent();
+      } else if (current.length === 0) {
+        current.push(pA);
+      }
+      continue;
+    }
+
+    const b = 2 * (fx * dx + fy * dy);
+    const disc = b * b - 4 * a * c;
+
+    if (disc <= 0) {
+      if (current.length === 0) current.push(pA);
+      current.push(pB);
+      continue;
+    }
+
+    const sqrtD = Math.sqrt(disc);
+    const t1 = (-b - sqrtD) / (2 * a);
+    const t2 = (-b + sqrtD) / (2 * a);
+    const u1 = Math.max(0, t1);
+    const u2 = Math.min(1, t2);
+
+    if (u1 >= u2) {
+      if (current.length === 0) current.push(pA);
+      current.push(pB);
+      continue;
+    }
+
+    anyClipped = true;
+
+    if (u1 > 1e-4) {
+      if (current.length === 0) current.push(pA);
+      current.push(lerpStrokePoint(pA, pB, u1));
+    }
+    flushCurrent();
+
+    if (u2 < 1 - 1e-4) {
+      current = [lerpStrokePoint(pA, pB, u2), pB];
     }
   }
-  if (current.length >= 2) {
-    chunks.push(current);
-  }
 
-  return chunks.map((pts) => ({
+  flushCurrent();
+
+  if (!anyClipped) return null;
+
+  return chunks.map((chunkPts) => ({
     ...stroke,
     id: makeId(),
-    points: pts,
-    bbox: computeBBox(pts, stroke.width),
+    points: chunkPts,
+    bbox: computeBBox(chunkPts, stroke.width),
   }));
 }
 
@@ -498,16 +631,33 @@ export function pointInPolygon(x: number, y: number, polygon: Array<{ x: number;
 }
 
 export function strokeInLasso(stroke: VectorStroke, polygon: Array<{ x: number; y: number }>): boolean {
-  if (polygon.length < 3) return false;
+  if (polygon.length < 3 || stroke.points.length === 0) return false;
+  if (stroke.points.length === 1) {
+    return pointInPolygon(stroke.points[0].x, stroke.points[0].y, polygon);
+  }
+
   let hits = 0;
-  const step = Math.max(1, Math.floor(stroke.points.length / 12));
   let checked = 0;
-  for (let i = 0; i < stroke.points.length; i += step) {
-    checked++;
-    if (pointInPolygon(stroke.points[i].x, stroke.points[i].y, polygon)) {
-      hits++;
+
+  for (let i = 0; i < stroke.points.length - 1; i++) {
+    const a = stroke.points[i];
+    const b = stroke.points[i + 1];
+    const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+    const subSteps = Math.max(1, Math.min(24, Math.ceil(segLen / 10)));
+    for (let s = 0; s < subSteps; s++) {
+      const t = s / subSteps;
+      checked++;
+      if (pointInPolygon(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, polygon)) {
+        hits++;
+      }
     }
   }
+  const last = stroke.points[stroke.points.length - 1];
+  checked++;
+  if (pointInPolygon(last.x, last.y, polygon)) {
+    hits++;
+  }
+
   return checked > 0 && hits / checked >= 0.45;
 }
 

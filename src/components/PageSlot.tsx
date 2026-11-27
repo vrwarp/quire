@@ -13,6 +13,11 @@ import {
   renderDryPenLayer,
   resolveStrokeColor,
 } from '../engine/canvasRenderer';
+import {
+  PAPER_THEME_PALETTE,
+  buildPaperTemplateSvgPaths,
+  getPaperTemplateSvgDataUri,
+} from '../engine/paperTemplate';
 import { pdfEngine, type PdfLinkAnnotation } from '../engine/pdfEngine';
 import { quireStorage } from '../engine/storage';
 
@@ -122,6 +127,19 @@ export function PageSlot({
 
   const scaledW = Math.round(page.widthPt * zoom);
   const scaledH = Math.round(page.heightPt * zoom);
+  const palette = PAPER_THEME_PALETTE[paperTheme];
+
+  const templateSvgSpec = useMemo(() => {
+    if (page.source.kind !== 'template' || page.source.template === 'blank') {
+      return null;
+    }
+    return buildPaperTemplateSvgPaths(page.source.template, page.widthPt, page.heightPt);
+  }, [page.source, page.widthPt, page.heightPt]);
+
+  const offscreenTemplateBg =
+    !isVisible && page.source.kind === 'template' && page.source.template !== 'blank'
+      ? getPaperTemplateSvgDataUri(page.source.template, paperTheme, page.widthPt, page.heightPt)
+      : undefined;
 
   const visibleHlStrokes = useMemo(
     () =>
@@ -153,7 +171,7 @@ export function PageSlot({
     ctx.drawImage(bitmap, 0, 0);
     // In Night Canvas PDF mode, keep highlighters on the separate un-inverted hlCanvasRef layer
     // so CSS invert() on pdfCanvasRef does not invert highlighter hues.
-    if (!shouldInvert && hasHighlighters && hlCanvasRef.current && hlCanvasRef.current.width > 0) {
+    if (!shouldInvert && hasHighlighters && hlCanvasRef.current && hlCanvasRef.current.width > 1) {
       ctx.save();
       ctx.globalCompositeOperation = 'multiply';
       ctx.drawImage(hlCanvasRef.current, 0, 0, pdfCanvas.width, pdfCanvas.height);
@@ -375,6 +393,7 @@ export function PageSlot({
         width: `${scaledW}px`,
         height: `${scaledH}px`,
         '--page-zoom': zoom,
+        backgroundImage: offscreenTemplateBg,
       }}
       onPointerDown={(e) => slotRef.current && onPointerDown(e as unknown as PointerEvent, page, slotRef.current)}
       onPointerMove={(e) => slotRef.current && onPointerMove(e as unknown as PointerEvent, page, slotRef.current)}
@@ -401,6 +420,8 @@ export function PageSlot({
           {images.map((img) => {
             const url = imageUrls[img.id];
             const isSel = selectedImageId === img.id;
+            const cropW = Math.max(0.1, img.crop.w);
+            const cropH = Math.max(0.1, img.crop.h);
             return (
               <div
                 key={img.id}
@@ -423,8 +444,12 @@ export function PageSlot({
                     src={url}
                     alt="Inserted media"
                     style={{
-                      objectPosition: `${img.crop.x * 100}% ${img.crop.y * 100}%`,
-                      transform: `scale(${1 / Math.max(0.2, img.crop.w)})`,
+                      position: 'absolute',
+                      left: `${-(img.crop.x / cropW) * 100}%`,
+                      top: `${-(img.crop.y / cropH) * 100}%`,
+                      width: `${100 / cropW}%`,
+                      height: `${100 / cropH}%`,
+                      objectFit: 'cover',
                     }}
                   />
                 )}
@@ -472,12 +497,83 @@ export function PageSlot({
             );
           })}
 
-          {/* Single-Layer Non-Darkening Highlighter Canvas (Always BELOW Pen Ink!) */}
+          {/* Single-Layer Non-Darkening Highlighter Canvas (Always BELOW Paper Rules & Pen Ink!) */}
           <canvas
             ref={hlCanvasRef}
             class="page-layer highlighter-layer"
             style={page.source.kind === 'pdf' && !invertPdf ? { display: 'none' } : undefined}
           />
+
+          {/* Area-Antialiased Canonical Vector Paper Template (Zero Tile-Wrap Seam & Zero Beat Aliasing) */}
+          {templateSvgSpec && (
+            <svg
+              class="page-layer page-template-svg"
+              viewBox={`0 0 ${page.widthPt} ${page.heightPt}`}
+              preserveAspectRatio="none"
+              aria-hidden="true"
+            >
+              {templateSvgSpec.dotted &&
+              templateSvgSpec.dotted.xsPt.length > 0 &&
+              templateSvgSpec.dotted.ysPt.length > 0 ? (
+                <>
+                  <defs>
+                    <pattern
+                      id={`dot-pat-${page.pageId}`}
+                      x={templateSvgSpec.dotted.startXPt - templateSvgSpec.dotted.stepPt / 2}
+                      y={templateSvgSpec.dotted.startYPt - templateSvgSpec.dotted.stepPt / 2}
+                      width={templateSvgSpec.dotted.stepPt}
+                      height={templateSvgSpec.dotted.stepPt}
+                      patternUnits="userSpaceOnUse"
+                    >
+                      <circle
+                        cx={templateSvgSpec.dotted.stepPt / 2}
+                        cy={templateSvgSpec.dotted.stepPt / 2}
+                        r={templateSvgSpec.dotted.radiusPt}
+                        fill={palette.ruleHex}
+                        fill-opacity={palette.ruleAlpha}
+                      />
+                    </pattern>
+                  </defs>
+                  <rect
+                    x={templateSvgSpec.dotted.xsPt[0] - templateSvgSpec.dotted.stepPt / 2}
+                    y={templateSvgSpec.dotted.ysPt[0] - templateSvgSpec.dotted.stepPt / 2}
+                    width={
+                      templateSvgSpec.dotted.xsPt[templateSvgSpec.dotted.xsPt.length - 1] -
+                      templateSvgSpec.dotted.xsPt[0] +
+                      templateSvgSpec.dotted.stepPt
+                    }
+                    height={
+                      templateSvgSpec.dotted.ysPt[templateSvgSpec.dotted.ysPt.length - 1] -
+                      templateSvgSpec.dotted.ysPt[0] +
+                      templateSvgSpec.dotted.stepPt
+                    }
+                    fill={`url(#dot-pat-${page.pageId})`}
+                  />
+                </>
+              ) : (
+                <>
+                  {templateSvgSpec.rulesPath && (
+                    <path
+                      d={templateSvgSpec.rulesPath}
+                      stroke={palette.ruleHex}
+                      stroke-opacity={palette.ruleAlpha}
+                      stroke-width={templateSvgSpec.ruleStrokeWidthPt}
+                      fill="none"
+                    />
+                  )}
+                  {templateSvgSpec.marginPath && (
+                    <path
+                      d={templateSvgSpec.marginPath}
+                      stroke={palette.marginHex}
+                      stroke-opacity={palette.marginAlpha}
+                      stroke-width={templateSvgSpec.marginStrokeWidthPt}
+                      fill="none"
+                    />
+                  )}
+                </>
+              )}
+            </svg>
+          )}
 
           {/* Crisp Vector Dry Pen Canvas */}
           <canvas ref={penCanvasRef} class="page-layer" />

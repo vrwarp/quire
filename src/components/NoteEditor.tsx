@@ -120,6 +120,7 @@ export function NoteEditor({
 
   const workerRef = useRef<Worker | null>(null);
   const fallbackWetCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const wetDprRef = useRef(1);
   const wetSeqRef = useRef(0);
   const governorRef = useRef<ProMotionGovernor | null>(null);
   const palmGuardRef = useRef(new PalmRejectionGuard(250));
@@ -262,7 +263,7 @@ export function NoteEditor({
     const ctx = fallbackWetCtxRef.current;
     const canvas = wetCanvasRef.current;
     if (!ctx || !canvas) return;
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const dpr = wetDprRef.current;
     if (msg.type === 'clear') {
       if (msg.seq !== undefined && msg.seq !== wetSeqRef.current) return;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -317,14 +318,22 @@ export function NoteEditor({
 
     const governor = new ProMotionGovernor(wrapper, {
       holdMs: 850,
+      scrollContainer: scroller,
       onStatusChange: (active) => {
         hzPillRef.current?.classList.toggle('boosted', active);
       },
     });
     governorRef.current = governor;
 
-    const dpr = Math.min(1.5, window.devicePixelRatio || 1);
+    const computeWetDpr = (w: number, h: number) => {
+      const rawDpr = Math.min(2, window.devicePixelRatio || 1);
+      const maxDpr = Math.sqrt((2400 * 1800) / Math.max(1, w * h));
+      return Math.max(1, Math.min(rawDpr, maxDpr));
+    };
+
     const rect = wrapper.getBoundingClientRect();
+    const dpr = computeWetDpr(rect.width, rect.height);
+    wetDprRef.current = dpr;
 
     // Transfer wet canvas to Dedicated OffscreenCanvas Worker (120 Hz AsyncSetLayerContents path)
     if (
@@ -361,24 +370,25 @@ export function NoteEditor({
         );
         workerRef.current = worker;
       } catch {
-        wetCanvas.width = Math.round(rect.width * dpr);
-        wetCanvas.height = Math.round(rect.height * dpr);
+        wetCanvas.width = Math.max(1, Math.round(rect.width * dpr));
+        wetCanvas.height = Math.max(1, Math.round(rect.height * dpr));
         fallbackWetCtxRef.current = wetCanvas.getContext('2d');
       }
     } else {
-      wetCanvas.width = Math.round(rect.width * dpr);
-      wetCanvas.height = Math.round(rect.height * dpr);
+      wetCanvas.width = Math.max(1, Math.round(rect.width * dpr));
+      wetCanvas.height = Math.max(1, Math.round(rect.height * dpr));
       fallbackWetCtxRef.current = wetCanvas.getContext('2d');
     }
 
     const resizeObs = new ResizeObserver(() => {
       const r = wrapper.getBoundingClientRect();
-      const curDpr = Math.min(1.5, window.devicePixelRatio || 1);
+      const curDpr = computeWetDpr(r.width, r.height);
+      wetDprRef.current = curDpr;
       if (workerRef.current) {
         workerRef.current.postMessage({ type: 'resize', width: r.width, height: r.height, dpr: curDpr });
       } else {
-        wetCanvas.width = Math.round(r.width * curDpr);
-        wetCanvas.height = Math.round(r.height * curDpr);
+        wetCanvas.width = Math.max(1, Math.round(r.width * curDpr));
+        wetCanvas.height = Math.max(1, Math.round(r.height * curDpr));
       }
       if (fitWidthModeRef.current) {
         const page = noteRef.current.pages[activePageIndexRef.current] ?? noteRef.current.pages[0];
@@ -390,12 +400,21 @@ export function NoteEditor({
     });
     resizeObs.observe(wrapper);
 
-    // 120 Hz Scroll Bus tracking active page index smoothly
+    // 120 Hz Scroll Bus tracking active page index smoothly & keeping active wet-stroke camera synced
     const scrollBus = createScrollBus({
       read: () => ({ left: scroller.scrollLeft, top: scroller.scrollTop }),
       onReading: () => {
         governor.wake();
-        if (activeStrokeRef.current) return;
+        const active = activeStrokeRef.current;
+        if (active) {
+          const wrapRect = wrapper.getBoundingClientRect();
+          const pRect = active.pageEl.getBoundingClientRect();
+          active.pageLeft = pRect.left;
+          active.pageTop = pRect.top;
+          active.offsetX = pRect.left - wrapRect.left;
+          active.offsetY = pRect.top - wrapRect.top;
+          return;
+        }
         const slots = scroller.querySelectorAll<HTMLElement>('[data-page-index]');
         const scrollerRect = scroller.getBoundingClientRect();
         const midY = scrollerRect.top + scrollerRect.height * 0.45;

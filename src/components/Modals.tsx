@@ -22,6 +22,7 @@ import type {
   ThemeMode,
   ToolbarDock,
 } from '../types';
+import { getPaperTemplateSvgDataUri } from '../engine/paperTemplate';
 
 /* ============================================================================
    1. Lightweight 1-Screen Welcome Sheet (CUJ 1 — Zero Mandatory Sign-up)
@@ -239,6 +240,10 @@ export function PageManagerModal({
               p.source.kind === 'template'
                 ? `paper-theme-${p.source.theme} paper-tpl-${p.source.template}`
                 : 'paper-theme-light';
+            const previewBg =
+              p.source.kind === 'template' && p.source.template !== 'blank'
+                ? getPaperTemplateSvgDataUri(p.source.template, p.source.theme, p.widthPt, p.heightPt)
+                : undefined;
             return (
               <div
                 key={p.pageId}
@@ -246,7 +251,7 @@ export function PageManagerModal({
               >
                 <div
                   class={`page-thumb-preview ${previewCls}`}
-                  style={{ cursor: 'pointer' }}
+                  style={{ cursor: 'pointer', backgroundImage: previewBg }}
                   onClick={() => {
                     onJumpToPage(idx);
                     onClose();

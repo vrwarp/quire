@@ -34,6 +34,7 @@ export class ProMotionGovernor {
     options?: {
       holdMs?: number;
       pacerPeriodMs?: number;
+      scrollContainer?: HTMLElement;
       onStatusChange?: (active: boolean) => void;
     }
   ) {
@@ -58,7 +59,7 @@ export class ProMotionGovernor {
     this.scrollKeep = document.createElement('span');
     this.scrollKeep.className = 'quire-scroll-keep';
     this.scrollKeep.setAttribute('aria-hidden', 'true');
-    this.host.appendChild(this.scrollKeep);
+    (options?.scrollContainer ?? this.host).appendChild(this.scrollKeep);
   }
 
   get isActive(): boolean {
