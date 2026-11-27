@@ -7,12 +7,15 @@ import {
   FolderPlus,
   Hash,
   Inbox,
+  Monitor,
+  Moon,
   Search,
   Settings,
   Star,
+  Sun,
   Trash2,
 } from 'lucide-preact';
-import type { Folder, NoteDocument } from '../types';
+import type { Folder, NoteDocument, ThemeMode } from '../types';
 import { getFolderDepth } from '../engine/storage';
 
 export type LibraryFilter =
@@ -29,6 +32,8 @@ interface LibrarySidebarProps {
   folders: Folder[];
   filter: LibraryFilter;
   searchQuery: string;
+  themeMode: ThemeMode;
+  onCycleTheme: () => void;
   onSearchChange: (q: string) => void;
   onSelectFilter: (f: LibraryFilter) => void;
   onNewNote: () => void;
@@ -47,6 +52,8 @@ export function LibrarySidebar({
   folders,
   filter,
   searchQuery,
+  themeMode,
+  onCycleTheme,
   onSearchChange,
   onSelectFilter,
   onNewNote,
@@ -130,16 +137,34 @@ export function LibrarySidebar({
           <img src="./icon.svg" alt="" />
           <span>Quire</span>
         </div>
-        <button
-          id="btn-open-settings"
-          type="button"
-          class="btn-icon"
-          title="Settings, Sync & Auto-Backup"
-          aria-label="Open Settings"
-          onClick={onOpenSettings}
-        >
-          <Settings size={17} />
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+          <button
+            id="btn-quick-theme"
+            type="button"
+            class="btn-icon"
+            title={`Theme: ${themeMode.charAt(0).toUpperCase() + themeMode.slice(1)} (click to cycle)`}
+            aria-label={`Theme mode: ${themeMode}`}
+            onClick={onCycleTheme}
+          >
+            {themeMode === 'dark' ? (
+              <Moon size={16} />
+            ) : themeMode === 'light' ? (
+              <Sun size={16} />
+            ) : (
+              <Monitor size={16} />
+            )}
+          </button>
+          <button
+            id="btn-open-settings"
+            type="button"
+            class="btn-icon"
+            title="Settings, Sync & Auto-Backup"
+            aria-label="Open Settings"
+            onClick={onOpenSettings}
+          >
+            <Settings size={17} />
+          </button>
+        </div>
       </div>
 
       <div class="sidebar-actions">

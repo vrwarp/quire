@@ -1,5 +1,8 @@
 export type PaperTemplate = 'blank' | 'lined' | 'grid' | 'dotted';
 export type PaperTheme = 'light' | 'cream' | 'dark';
+export type ThemeMode = 'system' | 'light' | 'dark';
+export type ResolvedTheme = 'light' | 'dark';
+export type NightCanvasMode = 'off' | 'paper' | 'paper-and-pdf';
 export type ScrollDirection = 'vertical' | 'horizontal';
 export type ToolbarDock = 'top' | 'left' | 'right';
 export type ToolKind = 'pen' | 'highlighter' | 'eraser' | 'lasso' | 'text' | 'pan';
@@ -158,7 +161,8 @@ export interface AppSettings {
   defaultTemplate: PaperTemplate;
   defaultPaperTheme: PaperTheme;
   defaultScrollDirection: ScrollDirection;
-  darkMode: boolean;
+  themeMode: ThemeMode;
+  nightCanvasMode: NightCanvasMode;
   toolbarDock: ToolbarDock;
   fingerDrawMode: boolean;
   eraserSize: EraserSizePreset;

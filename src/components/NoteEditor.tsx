@@ -34,6 +34,7 @@ import type {
   NoteDocument,
   PageDescriptor,
   PaperTheme,
+  ResolvedTheme,
   StrokePoint,
   TelemetrySnapshot,
   TextBoxItem,
@@ -63,8 +64,9 @@ import {
 } from '../engine/inputRouter';
 import { AudioSyncRecorder, formatDuration } from '../engine/audio';
 import { createBlankPage, createId, quireStorage } from '../engine/storage';
-import { drawVectorStroke } from '../engine/canvasRenderer';
+import { drawVectorStroke, resolveStrokeColor } from '../engine/canvasRenderer';
 import { pdfEngine } from '../engine/pdfEngine';
+import { resolveEffectivePaperTheme, shouldInvertPdfCanvas } from '../engine/theme';
 import type { InkWorkerMessage } from '../workers/ink.worker';
 import { PageSlot } from './PageSlot';
 
@@ -81,6 +83,7 @@ const ERASER_SIZE_PX: Record<EraserSizePreset, number> = {
 interface NoteEditorProps {
   note: NoteDocument;
   settings: AppSettings;
+  resolvedTheme: ResolvedTheme;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
   onBackToLibrary: () => void;
@@ -96,6 +99,7 @@ interface NoteEditorProps {
 export function NoteEditor({
   note,
   settings,
+  resolvedTheme,
   onBackToLibrary,
   onUpdateNote,
   onUpdateSettings,
@@ -243,6 +247,12 @@ export function NoteEditor({
     [lassoStrokeIds]
   );
 
+  const getEffectivePaperTheme = useCallback(
+    (page: PageDescriptor): PaperTheme =>
+      resolveEffectivePaperTheme(page.source, resolvedTheme, settings.nightCanvasMode),
+    [resolvedTheme, settings.nightCanvasMode]
+  );
+
   const sendToWetWorker = useCallback((msg: InkWorkerMessage) => {
     if (workerRef.current) {
       workerRef.current.postMessage(msg);
@@ -267,8 +277,11 @@ export function NoteEditor({
       ctx.arc(cx, cy, rCss, 0, Math.PI * 2);
       ctx.fillStyle = 'rgba(200, 90, 50, 0.12)';
       ctx.fill();
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = 'rgba(24, 24, 27, 0.8)';
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+      ctx.stroke();
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = 'rgba(24, 24, 27, 0.82)';
       ctx.stroke();
       ctx.restore();
     } else if (
@@ -824,7 +837,7 @@ export function NoteEditor({
             offsetX: pRect.left - wrapRect.left,
             offsetY: pRect.top - wrapRect.top,
             zoom,
-            paperTheme: curPage.source.kind === 'template' ? curPage.source.theme : 'light',
+            paperTheme: getEffectivePaperTheme(curPage),
             activeStrokes,
           });
         }
@@ -1136,7 +1149,7 @@ export function NoteEditor({
     const inkTool = effectiveTool === 'highlighter' ? 'highlighter' : 'pen';
     const color = inkTool === 'highlighter' ? hlColor : penColor;
     const width = inkTool === 'highlighter' ? hlWidth : penWidth;
-    const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
+    const paperTheme: PaperTheme = getEffectivePaperTheme(page);
     const startPerf = e.timeStamp || performance.now();
 
     const isPen = e.pointerType === 'pen';
@@ -1210,7 +1223,7 @@ export function NoteEditor({
     if (effectiveTool === 'lasso') {
       const { offsetX, offsetY, pRect } = getPageOffsets(pageEl);
       const pt = { x: (e.clientX - pRect.left) / zoom, y: (e.clientY - pRect.top) / zoom };
-      const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
+      const paperTheme: PaperTheme = getEffectivePaperTheme(page);
       if (lassoDragRef.current.active) {
         if (lassoDragRef.current.mode === 'resize') {
           const curDist = Math.max(
@@ -1454,7 +1467,7 @@ export function NoteEditor({
           offsetX,
           offsetY,
           zoom,
-          paperTheme: page.source.kind === 'template' ? page.source.theme : 'light',
+          paperTheme: getEffectivePaperTheme(page),
           polygon: [],
           bbox: lassoBBoxRef.current,
           liftedStrokes: updatedLifted,
@@ -1485,7 +1498,7 @@ export function NoteEditor({
             offsetX,
             offsetY,
             zoom,
-            paperTheme: page.source.kind === 'template' ? page.source.theme : 'light',
+            paperTheme: getEffectivePaperTheme(page),
             polygon: [],
             bbox: box,
             liftedStrokes: matched,
@@ -1828,6 +1841,8 @@ export function NoteEditor({
   };
 
   const activeSession = note.audioSessions.find((s) => s.id === playbackSessionId) ?? note.audioSessions[0];
+  const activePage = note.pages[activePageIndex] ?? note.pages[0];
+  const activePagePaperTheme: PaperTheme = activePage ? getEffectivePaperTheme(activePage) : 'light';
   const colorPresets =
     effectiveTool === 'highlighter' ? settings.highlighterColorPresets : settings.penColorPresets;
   const currentColor = effectiveTool === 'highlighter' ? hlColor : penColor;
@@ -2020,7 +2035,7 @@ export function NoteEditor({
               ...(fitWidthMode
                 ? {
                     background: 'var(--accent)',
-                    color: '#ffffff',
+                    color: 'var(--accent-ink)',
                     borderColor: 'var(--accent)',
                   }
                 : {}),
@@ -2159,7 +2174,7 @@ export function NoteEditor({
                     ...(active
                       ? {
                           background: 'var(--accent)',
-                          color: '#ffffff',
+                          color: 'var(--accent-ink)',
                           borderColor: 'var(--accent)',
                         }
                       : {}),
@@ -2182,7 +2197,7 @@ export function NoteEditor({
                 ...(settings.eraserAutoReturn
                   ? {
                       background: 'var(--accent)',
-                      color: '#ffffff',
+                      color: 'var(--accent-ink)',
                       borderColor: 'var(--accent)',
                     }
                   : {}),
@@ -2197,18 +2212,26 @@ export function NoteEditor({
         ) : (
           <>
             <div class="swatch-row">
-              {colorPresets.map((hex) => (
-                <button
-                  key={hex}
-                  type="button"
-                  class={`color-swatch ${currentColor === hex ? 'active' : ''}`}
-                  style={{ background: hex }}
-                  aria-label={`Color ${hex}`}
-                  onClick={() =>
-                    effectiveTool === 'highlighter' ? setHlColor(hex) : setPenColor(hex)
-                  }
-                />
-              ))}
+              {colorPresets.map((hex) => {
+                const displayHex =
+                  effectiveTool === 'highlighter'
+                    ? hex
+                    : resolveStrokeColor(hex, activePagePaperTheme, 'pen');
+                return (
+                  <button
+                    key={hex}
+                    type="button"
+                    class={`color-swatch ${currentColor === hex ? 'active' : ''}`}
+                    style={{ background: displayHex }}
+                    data-canonical-color={hex}
+                    data-resolved-color={displayHex}
+                    aria-label={`Color ${displayHex}`}
+                    onClick={() =>
+                      effectiveTool === 'highlighter' ? setHlColor(hex) : setPenColor(hex)
+                    }
+                  />
+                );
+              })}
             </div>
             <input
               class="width-slider"
@@ -2256,16 +2279,19 @@ export function NoteEditor({
         <div class="lasso-actions" role="toolbar" aria-label="Lasso Selection Actions">
           <span style={{ fontWeight: 600 }}>{lassoStrokeIds.length} selected</span>
           <span class="toolbar-divider" />
-          {settings.penColorPresets.slice(0, 4).map((hex) => (
-            <button
-              key={hex}
-              type="button"
-              class="color-swatch"
-              style={{ background: hex, width: '16px', height: '16px' }}
-              aria-label={`Recolor selection to ${hex}`}
-              onClick={() => recolorLasso(hex)}
-            />
-          ))}
+          {settings.penColorPresets.slice(0, 4).map((hex) => {
+            const displayHex = resolveStrokeColor(hex, activePagePaperTheme, 'pen');
+            return (
+              <button
+                key={hex}
+                type="button"
+                class="color-swatch"
+                style={{ background: displayHex, width: '16px', height: '16px' }}
+                aria-label={`Recolor selection to ${displayHex}`}
+                onClick={() => recolorLasso(hex)}
+              />
+            );
+          })}
           <button type="button" class="btn-secondary" style={{ padding: '3px 7px', fontSize: '11.5px' }} onClick={() => scaleLasso(1.15)}>
             +Size
           </button>
@@ -2305,6 +2331,12 @@ export function NoteEditor({
           >
             {note.pages.map((page, idx) => {
               const isVisible = Math.abs(idx - activePageIndex) <= 2;
+              const effectivePaperTheme = getEffectivePaperTheme(page);
+              const invertPdf = shouldInvertPdfCanvas(
+                page.source,
+                resolvedTheme,
+                settings.nightCanvasMode
+              );
               return (
                 <PageSlot
                   key={page.pageId}
@@ -2312,6 +2344,8 @@ export function NoteEditor({
                   pageIndex={idx}
                   zoom={zoom}
                   isVisible={isVisible}
+                  effectivePaperTheme={effectivePaperTheme}
+                  invertPdf={invertPdf}
                   activeTool={effectiveTool}
                   fingerDrawMode={settings.fingerDrawMode}
                   strokes={note.strokesByPage[page.pageId] ?? EMPTY_STROKES}

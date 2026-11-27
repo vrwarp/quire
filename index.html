@@ -9,8 +9,24 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Quire" />
-    <meta name="theme-color" content="#f7f4ee" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#16181d" media="(prefers-color-scheme: dark)" />
+    <meta id="meta-theme-color" name="theme-color" content="#ebe6dc" />
+    <script>
+      (function () {
+        try {
+          var mode = localStorage.getItem('quire-theme-mode') || 'system';
+          var dark =
+            mode === 'dark' ||
+            (mode !== 'light' &&
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var resolved = dark ? 'dark' : 'light';
+          document.documentElement.dataset.theme = resolved;
+          document.documentElement.style.colorScheme = resolved;
+          var meta = document.getElementById('meta-theme-color');
+          if (meta) meta.setAttribute('content', dark ? '#121418' : '#ebe6dc');
+        } catch (e) {}
+      })();
+    </script>
     <meta
       name="description"
       content="Quire — Fast, 120 Hz local-first handwritten note-taking, PDF annotation, and stroke-synced audio review for iPadOS and the Web."

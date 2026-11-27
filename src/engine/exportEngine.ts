@@ -167,8 +167,8 @@ export async function exportNoteToVectorPdf(
         y: pageHeight,
         borderColor: rgb(c.r, c.g, c.b),
         borderWidth: stroke.width,
-        borderOpacity: 0.34,
-        blendMode: BlendMode.Multiply,
+        borderOpacity: paperTheme === 'dark' ? 0.28 : 0.34,
+        blendMode: paperTheme === 'dark' ? BlendMode.Screen : BlendMode.Multiply,
       });
     }
 
