@@ -27,6 +27,7 @@ import {
 } from './engine/storage';
 import { generateOrderKey } from './engine/inkMath';
 import { pdfEngine } from './engine/pdfEngine';
+import { getPaperTemplateSvgDataUri } from './engine/paperTemplate';
 import { mergeNoteVersions, tickHLC } from './engine/syncEngine';
 import {
   applyDocumentTheme,
@@ -663,6 +664,15 @@ export function App() {
                       firstPage?.source.kind === 'template'
                         ? `paper-theme-${effectiveThumbTheme} paper-tpl-${firstPage.source.template}`
                         : `paper-theme-${effectiveThumbTheme}`;
+                    const thumbBg =
+                      firstPage?.source.kind === 'template' && firstPage.source.template !== 'blank'
+                        ? getPaperTemplateSvgDataUri(
+                            firstPage.source.template,
+                            effectiveThumbTheme,
+                            firstPage.widthPt,
+                            firstPage.heightPt
+                          )
+                        : undefined;
                     const isTrash = !!n.deletedAt;
 
                     return (
@@ -681,7 +691,10 @@ export function App() {
                         }}
                       >
                         {viewMode === 'grid' && (
-                          <div class={`note-thumb ${thumbCls}`}>
+                          <div
+                            class={`note-thumb ${thumbCls}`}
+                            style={thumbBg ? { backgroundImage: thumbBg } : undefined}
+                          >
                             <span class="note-thumb-badge">
                               {firstPage?.source.kind === 'pdf' ? 'PDF · ' : ''}
                               {n.pages.length} {n.pages.length === 1 ? 'page' : 'pages'}

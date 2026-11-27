@@ -38,6 +38,14 @@ import {
   resolveThemeMode,
   shouldInvertPdfCanvas,
 } from '../src/engine/theme';
+import {
+  LINED_FIRST_RULE_Y_PT,
+  LINED_MARGIN_X_PT,
+  LINED_STEP_PT,
+  buildPaperTemplateSvgPaths,
+  getPaperTemplateGeometry,
+  getPaperTemplateSvgDataUri,
+} from '../src/engine/paperTemplate';
 import { ProMotionGovernor } from '../src/engine/promotion';
 import type { Folder, NoteDocument, PageSource, StrokePoint, VectorStroke } from '../src/types';
 
@@ -606,5 +614,149 @@ describe('Dark/Light Mode (Tier 1) & Non-Destructive Night Canvas (Tier 2)', () 
   });
 });
 
+describe('Canonical Paper Templates & Continuous-Segment Geometry Consistency', () => {
+  it('generates uniform lined rules with zero tile-wrap header seam and exact 26pt spacing', () => {
+    const geom = getPaperTemplateGeometry('lined', 612, 792);
+    expect(geom.kind).toBe('lined');
+    if (geom.kind !== 'lined') return;
 
+    expect(geom.marginXPt).toBe(LINED_MARGIN_X_PT);
+    expect(geom.ruleYsPt[0]).toBe(LINED_FIRST_RULE_Y_PT);
+    expect(geom.ruleYsPt.length).toBeGreaterThanOrEqual(27);
 
+    // Every consecutive pair of rules (including 2nd -> 3rd!) must have identical 26pt spacing
+    for (let i = 1; i < geom.ruleYsPt.length; i++) {
+      expect(geom.ruleYsPt[i] - geom.ruleYsPt[i - 1]).toBe(LINED_STEP_PT);
+    }
+
+    const svgUri = getPaperTemplateSvgDataUri('lined', 'light', 612, 792);
+    expect(svgUri.startsWith('url("data:image/svg+xml,')).toBe(true);
+    expect(getPaperTemplateSvgDataUri('blank', 'light', 612, 792)).toBe('none');
+  });
+
+  it('centers grid and dotted templates symmetrically away from rounded page borders', () => {
+    const grid = getPaperTemplateGeometry('grid', 612, 792);
+    expect(grid.kind).toBe('grid');
+    if (grid.kind === 'grid') {
+      const leftMargin = grid.verticalXsPt[0];
+      const rightMargin = 612 - grid.verticalXsPt[grid.verticalXsPt.length - 1];
+      expect(leftMargin).toBeGreaterThanOrEqual(14);
+      expect(leftMargin).toBeCloseTo(rightMargin, 2);
+      for (let i = 1; i < grid.horizontalYsPt.length; i++) {
+        expect(grid.horizontalYsPt[i] - grid.horizontalYsPt[i - 1]).toBe(26);
+      }
+    }
+
+    const dotted = getPaperTemplateGeometry('dotted', 612, 792);
+    expect(dotted.kind).toBe('dotted');
+    if (dotted.kind === 'dotted') {
+      const leftMargin = dotted.xsPt[0];
+      const rightMargin = 612 - dotted.xsPt[dotted.xsPt.length - 1];
+      expect(leftMargin).toBeGreaterThanOrEqual(14);
+      expect(leftMargin).toBeCloseTo(rightMargin, 2);
+      for (let i = 1; i < dotted.ysPt.length; i++) {
+        expect(dotted.ysPt[i] - dotted.ysPt[i - 1]).toBe(24);
+      }
+    }
+
+    const paths = buildPaperTemplateSvgPaths('grid', 612, 792);
+    expect(paths.rulesPath.length).toBeGreaterThan(50);
+    expect(getPaperTemplateSvgDataUri('dotted', 'cream', 612, 792)).toContain('pattern');
+  });
+
+  it('exports lined, grid, and dotted Vector PDFs with 1-point taps and round pen endcaps', async () => {
+    const note = createNewNote(DEFAULT_SETTINGS, null, 'All Templates Export');
+    const p0 = note.pages[0];
+    note.pages.push(
+      {
+        pageId: 'pg_grid',
+        orderKey: '2000',
+        widthPt: 612,
+        heightPt: 792,
+        source: { kind: 'template', template: 'grid', theme: 'light' },
+      },
+      {
+        pageId: 'pg_dotted',
+        orderKey: '3000',
+        widthPt: 612,
+        heightPt: 792,
+        source: { kind: 'template', template: 'dotted', theme: 'dark' },
+      }
+    );
+    note.strokesByPage[p0.pageId] = [
+      {
+        id: 'tap_pen',
+        pageId: p0.pageId,
+        tool: 'pen',
+        color: '#18181b',
+        width: 4,
+        points: [makePt(100, 108)],
+        bbox: computeBBox([makePt(100, 108)], 4),
+      },
+      {
+        id: 'tap_hl',
+        pageId: p0.pageId,
+        tool: 'highlighter',
+        color: '#facc15',
+        width: 18,
+        points: [makePt(140, 108)],
+        bbox: computeBBox([makePt(140, 108)], 18),
+      },
+    ];
+    const pdfBytes = await exportNoteToVectorPdf(note, { includeBackground: true });
+    const parsed = await PDFDocument.load(pdfBytes);
+    expect(parsed.getPageCount()).toBe(3);
+  });
+
+  it('splits 2-point straight shafts with partialEraseStroke and selects sparse shafts in Lasso', () => {
+    // 2-vertex 300pt straight shaft (previously missed completely by vertex-only partial erase!)
+    const twoPointShaft: VectorStroke = {
+      id: 'str_shaft',
+      pageId: 'pg_1',
+      tool: 'pen',
+      color: '#18181b',
+      width: 3,
+      points: [makePt(20, 100, 0), makePt(320, 100, 50)],
+      bbox: computeBBox([makePt(20, 100), makePt(320, 100)], 3),
+    };
+    let idSeq = 0;
+    const split = partialEraseStroke(twoPointShaft, 170, 100, 16, () => `seg_${++idSeq}`);
+    expect(split).not.toBeNull();
+    expect(split!.length).toBe(2);
+    expect(split![0].points[split![0].points.length - 1].x).toBeCloseTo(170 - 17.05, 1);
+    expect(split![1].points[0].x).toBeCloseTo(170 + 17.05, 1);
+
+    // Lasso polygon covering 60% of the middle of the 2-point shaft (neither endpoint inside!)
+    const midLasso = [
+      { x: 60, y: 70 },
+      { x: 280, y: 70 },
+      { x: 280, y: 130 },
+      { x: 60, y: 130 },
+    ];
+    expect(strokeInLasso(twoPointShaft, midLasso)).toBe(true);
+  });
+
+  it('prevents 90-degree corner pinching and 180-degree arrow wing collapse in buildStrokeOutline', () => {
+    // 90-degree corner at (100, 20)
+    const cornerPts = [makePt(20, 20), makePt(100, 20), makePt(100, 100)];
+    const { left, right } = buildStrokeOutline(cornerPts, 6, false);
+    expect(left.length).toBe(right.length);
+    for (let i = 0; i < left.length; i++) {
+      const span = Math.hypot(left[i].x - right[i].x, left[i].y - right[i].y);
+      // Width must never pinch below normal stroke width or collapse to 0
+      expect(span).toBeGreaterThan(3.0);
+    }
+
+    // 180-degree hairpin reversal (snapped arrow wing: tip -> wing1 -> tip -> wing2)
+    const arrowPts = [
+      makePt(40, 100),
+      makePt(180, 100),
+      makePt(162, 90),
+      makePt(180, 100),
+      makePt(162, 110),
+    ];
+    const arrowOutline = buildStrokeOutline(arrowPts, 4, false);
+    expect(arrowOutline.left.length).toBe(arrowOutline.right.length);
+    expect(arrowOutline.left.length).toBeGreaterThan(arrowPts.length);
+  });
+});

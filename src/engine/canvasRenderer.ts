@@ -56,7 +56,16 @@ export function drawVectorStroke(
 
   ctx.save();
   if (stroke.tool === 'highlighter') {
-    ctx.globalAlpha = 0.34 * opacity;
+    const baseHlAlpha = paperTheme === 'dark' ? 0.28 : 0.34;
+    ctx.globalAlpha = baseHlAlpha * opacity;
+    if (pts.length === 1) {
+      ctx.fillStyle = resolvedColor;
+      ctx.beginPath();
+      ctx.arc(pts[0].x, pts[0].y, stroke.width * 0.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
     ctx.strokeStyle = resolvedColor;
     ctx.lineWidth = stroke.width;
     ctx.lineCap = 'butt';
@@ -146,6 +155,19 @@ export function renderDryHighlighterLayer(
   paperTheme: PaperTheme,
   hiddenIds?: Set<string>
 ): void {
+  const highlighters = strokes.filter(
+    (s) => s.tool === 'highlighter' && (!hiddenIds || hiddenIds.size === 0 || !hiddenIds.has(s.id))
+  );
+  if (highlighters.length === 0) {
+    if (canvas.width !== 1 || canvas.height !== 1) {
+      canvas.width = 1;
+      canvas.height = 1;
+    } else {
+      canvas.getContext('2d')?.clearRect(0, 0, 1, 1);
+    }
+    return;
+  }
+
   const pxW = Math.max(1, Math.round(widthPt * scale));
   const pxH = Math.max(1, Math.round(heightPt * scale));
   if (canvas.width !== pxW || canvas.height !== pxH) {
@@ -155,11 +177,6 @@ export function renderDryHighlighterLayer(
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   ctx.clearRect(0, 0, pxW, pxH);
-
-  const highlighters = strokes.filter(
-    (s) => s.tool === 'highlighter' && (!hiddenIds || hiddenIds.size === 0 || !hiddenIds.has(s.id))
-  );
-  if (highlighters.length === 0) return;
 
   // Group by color so repeated passes of the same highlighter color stay single-layer flat alpha
   const byColor = new Map<string, VectorStroke[]>();
@@ -178,10 +195,17 @@ export function renderDryHighlighterLayer(
     sctx.save();
     sctx.scale(scale, scale);
     sctx.strokeStyle = color;
+    sctx.fillStyle = color;
     sctx.lineCap = 'butt';
     sctx.lineJoin = 'round';
     for (const stroke of group) {
       if (stroke.points.length === 0) continue;
+      if (stroke.points.length === 1) {
+        sctx.beginPath();
+        sctx.arc(stroke.points[0].x, stroke.points[0].y, stroke.width * 0.5, 0, Math.PI * 2);
+        sctx.fill();
+        continue;
+      }
       sctx.lineWidth = stroke.width;
       sctx.beginPath();
       sctx.moveTo(stroke.points[0].x, stroke.points[0].y);
@@ -193,7 +217,7 @@ export function renderDryHighlighterLayer(
     sctx.restore();
 
     ctx.save();
-    ctx.globalAlpha = paperTheme === 'dark' ? 0.28 : 0.36;
+    ctx.globalAlpha = paperTheme === 'dark' ? 0.28 : 0.34;
     ctx.drawImage(scratch, 0, 0);
     ctx.restore();
   }
@@ -242,6 +266,19 @@ export function renderDryPenLayer(
     replayTimeMs?: number;
   }
 ): void {
+  const penStrokes = strokes.filter(
+    (s) => s.tool === 'pen' && (!options?.hiddenIds || !options.hiddenIds.has(s.id))
+  );
+  if (penStrokes.length === 0) {
+    if (canvas.width !== 1 || canvas.height !== 1) {
+      canvas.width = 1;
+      canvas.height = 1;
+    } else {
+      canvas.getContext('2d')?.clearRect(0, 0, 1, 1);
+    }
+    return;
+  }
+
   const pxW = Math.max(1, Math.round(widthPt * scale));
   const pxH = Math.max(1, Math.round(heightPt * scale));
   if (canvas.width !== pxW || canvas.height !== pxH) {
@@ -254,10 +291,7 @@ export function renderDryPenLayer(
 
   ctx.save();
   ctx.scale(scale, scale);
-  for (const stroke of strokes) {
-    if (stroke.tool !== 'pen') continue;
-    if (options?.hiddenIds?.has(stroke.id)) continue;
-
+  for (const stroke of penStrokes) {
     if (
       options?.replaySessionId &&
       stroke.audioSessionId === options.replaySessionId &&

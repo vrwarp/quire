@@ -1,8 +1,13 @@
-import { PDFDocument, rgb, StandardFonts, BlendMode, PDFPage } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts, BlendMode, PDFPage, degrees } from 'pdf-lib';
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 import type { NoteDocument, PageDescriptor, PaperTheme } from '../types';
 import { buildStrokeOutline } from './inkMath';
 import { resolveStrokeColor, renderDryHighlighterLayer, renderDryPenLayer } from './canvasRenderer';
+import {
+  PAPER_THEME_PALETTE,
+  drawPaperTemplateCanvas,
+  getPaperTemplateGeometry,
+} from './paperTemplate';
 import { quireStorage } from './storage';
 import { pdfEngine } from './pdfEngine';
 
@@ -32,46 +37,61 @@ function drawPaperTemplatePdf(page: PDFPage, desc: PageDescriptor): void {
   if (desc.source.kind !== 'template') return;
   const { template, theme } = desc.source;
   const { widthPt: w, heightPt: h } = desc;
+  const palette = PAPER_THEME_PALETTE[theme];
 
-  const bg =
-    theme === 'dark'
-      ? rgb(0.09, 0.1, 0.12)
-      : theme === 'cream'
-      ? rgb(0.98, 0.965, 0.933)
-      : rgb(1, 1, 1);
-  page.drawRectangle({ x: 0, y: 0, width: w, height: h, color: bg });
+  page.drawRectangle({
+    x: 0,
+    y: 0,
+    width: w,
+    height: h,
+    color: rgb(palette.bgRgb.r, palette.bgRgb.g, palette.bgRgb.b),
+  });
 
   if (template === 'blank') return;
 
-  const lineColor =
-    theme === 'dark'
-      ? rgb(0.22, 0.24, 0.28)
-      : theme === 'cream'
-      ? rgb(0.84, 0.81, 0.75)
-      : rgb(0.86, 0.88, 0.91);
+  const geom = getPaperTemplateGeometry(template, w, h);
+  const lineColor = rgb(palette.rulePdfRgb.r, palette.rulePdfRgb.g, palette.rulePdfRgb.b);
+  const marginColor = rgb(palette.marginPdfRgb.r, palette.marginPdfRgb.g, palette.marginPdfRgb.b);
 
-  const spacing = 26;
-  if (template === 'lined') {
-    for (let y = h - 72; y >= 36; y -= spacing) {
-      page.drawLine({ start: { x: 36, y }, end: { x: w - 36, y }, thickness: 0.6, color: lineColor });
+  if (geom.kind === 'lined') {
+    for (const yTop of geom.ruleYsPt) {
+      const yPdf = h - yTop;
+      page.drawLine({
+        start: { x: 0, y: yPdf },
+        end: { x: w, y: yPdf },
+        thickness: geom.ruleStrokeWidthPt,
+        color: lineColor,
+      });
     }
     page.drawLine({
-      start: { x: 64, y: 0 },
-      end: { x: 64, y: h },
-      thickness: 0.75,
-      color: theme === 'dark' ? rgb(0.45, 0.22, 0.2) : rgb(0.9, 0.65, 0.62),
+      start: { x: geom.marginXPt, y: 0 },
+      end: { x: geom.marginXPt, y: h },
+      thickness: geom.marginStrokeWidthPt,
+      color: marginColor,
     });
-  } else if (template === 'grid') {
-    for (let x = 24; x < w; x += spacing) {
-      page.drawLine({ start: { x, y: 0 }, end: { x, y: h }, thickness: 0.5, color: lineColor });
+  } else if (geom.kind === 'grid') {
+    for (const x of geom.verticalXsPt) {
+      page.drawLine({
+        start: { x, y: 0 },
+        end: { x, y: h },
+        thickness: geom.strokeWidthPt,
+        color: lineColor,
+      });
     }
-    for (let y = 24; y < h; y += spacing) {
-      page.drawLine({ start: { x: 0, y }, end: { x: w, y }, thickness: 0.5, color: lineColor });
+    for (const yTop of geom.horizontalYsPt) {
+      const yPdf = h - yTop;
+      page.drawLine({
+        start: { x: 0, y: yPdf },
+        end: { x: w, y: yPdf },
+        thickness: geom.strokeWidthPt,
+        color: lineColor,
+      });
     }
-  } else if (template === 'dotted') {
-    for (let x = 24; x < w; x += spacing) {
-      for (let y = 24; y < h; y += spacing) {
-        page.drawCircle({ x, y, size: 1, color: lineColor });
+  } else if (geom.kind === 'dotted') {
+    for (const yTop of geom.ysPt) {
+      const yPdf = h - yTop;
+      for (const x of geom.xsPt) {
+        page.drawCircle({ x, y: yPdf, size: geom.radiusPt, color: lineColor });
       }
     }
   }
@@ -81,8 +101,8 @@ function drawPaperTemplatePdf(page: PDFPage, desc: PageDescriptor): void {
  * Exports a NoteDocument as a crisp Vector PDF (FR-SYN-03).
  *
  * - Preserves original imported PDF pages, selectable text, and vector graphics.
- * - Renders Highlighter strokes with Multiply blend mode behind pen ink.
- * - Renders variable-width Pen strokes as closed vector SVG paths (infinite zoom sharpness).
+ * - Renders Highlighter strokes with Multiply/Screen blend mode behind pen ink.
+ * - Renders variable-width Pen strokes as closed vector SVG paths + round endcaps.
  * - Embeds typed text boxes and inserted images.
  */
 export async function exportNoteToVectorPdf(
@@ -119,6 +139,9 @@ export async function exportNoteToVectorPdf(
       }
       if (srcDoc && desc.source.pdfPageNumber <= srcDoc.getPageCount()) {
         const [copied] = await outPdf.copyPages(srcDoc, [desc.source.pdfPageNumber - 1]);
+        if (desc.source.rotation) {
+          copied.setRotation(degrees(desc.source.rotation));
+        }
         pdfPage = outPdf.addPage(copied);
       } else {
         pdfPage = outPdf.addPage([desc.widthPt, desc.heightPt]);
@@ -146,6 +169,7 @@ export async function exportNoteToVectorPdf(
           y: pageHeight - img.y - img.height,
           width: img.width,
           height: img.height,
+          rotate: img.rotation ? degrees(-img.rotation) : undefined,
         });
       } catch {
         // Ignore unsupported image codec during export
@@ -153,11 +177,24 @@ export async function exportNoteToVectorPdf(
     }
 
     const strokes = note.strokesByPage[desc.pageId] ?? [];
+    const hlOpacity = paperTheme === 'dark' ? 0.28 : 0.34;
+    const hlBlend = paperTheme === 'dark' ? BlendMode.Screen : BlendMode.Multiply;
 
-    // 2. Vector Highlighter strokes (behind pen ink, Multiply blend mode)
+    // 2. Vector Highlighter strokes (behind pen ink, Multiply/Screen blend mode)
     for (const stroke of strokes) {
-      if (stroke.tool !== 'highlighter' || stroke.points.length < 2) continue;
+      if (stroke.tool !== 'highlighter' || stroke.points.length === 0) continue;
       const c = hexToRgb(stroke.color);
+      if (stroke.points.length === 1) {
+        pdfPage.drawCircle({
+          x: stroke.points[0].x,
+          y: pageHeight - stroke.points[0].y,
+          size: stroke.width * 0.5,
+          color: rgb(c.r, c.g, c.b),
+          opacity: hlOpacity,
+          blendMode: hlBlend,
+        });
+        continue;
+      }
       const pathParts = [`M ${stroke.points[0].x.toFixed(2)} ${stroke.points[0].y.toFixed(2)}`];
       for (let i = 1; i < stroke.points.length; i++) {
         pathParts.push(`L ${stroke.points[i].x.toFixed(2)} ${stroke.points[i].y.toFixed(2)}`);
@@ -167,16 +204,29 @@ export async function exportNoteToVectorPdf(
         y: pageHeight,
         borderColor: rgb(c.r, c.g, c.b),
         borderWidth: stroke.width,
-        borderOpacity: paperTheme === 'dark' ? 0.28 : 0.34,
-        blendMode: paperTheme === 'dark' ? BlendMode.Screen : BlendMode.Multiply,
+        borderOpacity: hlOpacity,
+        blendMode: hlBlend,
       });
     }
 
-    // 3. Vector Pen strokes (closed variable-width polygon outlines for infinite zoom crispness)
+    // 3. Vector Pen strokes (closed variable-width polygon outlines + round endcaps)
     for (const stroke of strokes) {
       if (stroke.tool !== 'pen' || stroke.points.length === 0) continue;
       const resolved = resolveStrokeColor(stroke.color, paperTheme, 'pen');
       const c = hexToRgb(resolved);
+      const fillColor = rgb(c.r, c.g, c.b);
+
+      if (stroke.points.length === 1) {
+        const r = Math.max(0.75, stroke.width * 0.45);
+        pdfPage.drawCircle({
+          x: stroke.points[0].x,
+          y: pageHeight - stroke.points[0].y,
+          size: r,
+          color: fillColor,
+        });
+        continue;
+      }
+
       const { left, right } = buildStrokeOutline(stroke.points, stroke.width, false);
       if (left.length === 0) continue;
 
@@ -192,7 +242,31 @@ export async function exportNoteToVectorPdf(
       pdfPage.drawSvgPath(d.join(' '), {
         x: 0,
         y: pageHeight,
-        color: rgb(c.r, c.g, c.b),
+        color: fillColor,
+      });
+
+      const startR = Math.max(
+        0.5,
+        Math.hypot(left[0].x - right[0].x, left[0].y - right[0].y) * 0.5
+      );
+      const endIdx = left.length - 1;
+      const endR = Math.max(
+        0.5,
+        Math.hypot(left[endIdx].x - right[endIdx].x, left[endIdx].y - right[endIdx].y) * 0.5
+      );
+      const firstPt = stroke.points[0];
+      const lastPt = stroke.points[stroke.points.length - 1];
+      pdfPage.drawCircle({
+        x: firstPt.x,
+        y: pageHeight - firstPt.y,
+        size: startR,
+        color: fillColor,
+      });
+      pdfPage.drawCircle({
+        x: lastPt.x,
+        y: pageHeight - lastPt.y,
+        size: endR,
+        color: fillColor,
       });
     }
 
@@ -257,25 +331,108 @@ export async function exportPageToPng(
   if (desc.source.kind === 'pdf') {
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, w, h);
-    const tile = await pdfEngine.renderPageTile(desc.source.blobKey, desc.source.pdfPageNumber, scale);
+    const tile = await pdfEngine.renderPageTile(
+      desc.source.blobKey,
+      desc.source.pdfPageNumber,
+      scale,
+      desc.source.rotation
+    );
     if (tile) ctx.drawImage(tile, 0, 0, w, h);
   } else if (includeBackground) {
-    ctx.fillStyle =
-      paperTheme === 'dark' ? '#16181d' : paperTheme === 'cream' ? '#faf6ee' : '#ffffff';
-    ctx.fillRect(0, 0, w, h);
+    drawPaperTemplateCanvas(ctx, desc.source.template, paperTheme, desc.widthPt, desc.heightPt, scale, {
+      fillBackground: true,
+      drawRules: false,
+    });
+  }
+
+  // Embedded images
+  const images = note.imagesByPage[desc.pageId] ?? [];
+  if (typeof createImageBitmap === 'function') {
+    for (const img of images) {
+      const bytes = await quireStorage.loadBlob(img.blobKey);
+      if (!bytes) continue;
+      try {
+        const bmp = await createImageBitmap(new Blob([new Uint8Array(bytes)]));
+        const cropW = Math.max(0.1, img.crop.w);
+        const cropH = Math.max(0.1, img.crop.h);
+        const sx = img.crop.x * bmp.width;
+        const sy = img.crop.y * bmp.height;
+        const sw = Math.min(bmp.width - sx, cropW * bmp.width);
+        const sh = Math.min(bmp.height - sy, cropH * bmp.height);
+        ctx.save();
+        ctx.scale(scale, scale);
+        ctx.translate(img.x + img.width / 2, img.y + img.height / 2);
+        if (img.rotation) {
+          ctx.rotate((img.rotation * Math.PI) / 180);
+        }
+        ctx.drawImage(bmp, sx, sy, sw, sh, -img.width / 2, -img.height / 2, img.width, img.height);
+        ctx.restore();
+        bmp.close();
+      } catch {
+        // Ignore unsupported image decode in headless environments
+      }
+    }
   }
 
   const strokes = note.strokesByPage[desc.pageId] ?? [];
   const hlCanvas = document.createElement('canvas');
   renderDryHighlighterLayer(hlCanvas, strokes, desc.widthPt, desc.heightPt, scale, paperTheme);
-  ctx.save();
-  ctx.globalCompositeOperation = paperTheme === 'dark' ? 'screen' : 'multiply';
-  ctx.drawImage(hlCanvas, 0, 0);
-  ctx.restore();
+  if (hlCanvas.width > 1) {
+    ctx.save();
+    if (desc.source.kind === 'pdf') {
+      ctx.globalCompositeOperation = 'multiply';
+    } else {
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    ctx.drawImage(hlCanvas, 0, 0);
+    ctx.restore();
+  }
+
+  // Draw canonical paper template rules/grid/dots cleanly over highlighters and below pen ink
+  if (desc.source.kind === 'template' && includeBackground) {
+    drawPaperTemplateCanvas(ctx, desc.source.template, paperTheme, desc.widthPt, desc.heightPt, scale, {
+      fillBackground: false,
+      drawRules: true,
+    });
+  }
 
   const penCanvas = document.createElement('canvas');
   renderDryPenLayer(penCanvas, strokes, desc.widthPt, desc.heightPt, scale, paperTheme);
-  ctx.drawImage(penCanvas, 0, 0);
+  if (penCanvas.width > 1) {
+    ctx.drawImage(penCanvas, 0, 0);
+  }
+
+  // Typed text boxes
+  const textBoxes = note.textBoxesByPage[desc.pageId] ?? [];
+  if (textBoxes.length > 0) {
+    ctx.save();
+    ctx.scale(scale, scale);
+    ctx.textBaseline = 'top';
+    for (const box of textBoxes) {
+      if (!box.plainText.trim()) continue;
+      const family =
+        box.fontFamily === 'serif'
+          ? 'Georgia, serif'
+          : box.fontFamily === 'mono'
+          ? 'ui-monospace, Menlo, monospace'
+          : '-apple-system, BlinkMacSystemFont, sans-serif';
+      const style = `${box.italic ? 'italic ' : ''}${box.bold ? '700 ' : '400 '}${box.fontSize}px ${family}`;
+      ctx.font = style;
+      ctx.fillStyle = resolveStrokeColor(box.color, paperTheme, 'pen');
+      const lines = box.plainText.split('\n');
+      const lineHeight = box.fontSize * 1.38;
+      lines.forEach((line, lineIdx) => {
+        const prefix =
+          box.listMode === 'bullet'
+            ? '• '
+            : box.listMode === 'numbered'
+            ? `${lineIdx + 1}. `
+            : '';
+        ctx.fillText(prefix + line, box.x + 6, box.y + 4 + lineIdx * lineHeight);
+      });
+    }
+    ctx.restore();
+  }
 
   return await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('PNG export failed'))), 'image/png');

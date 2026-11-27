@@ -79,8 +79,8 @@ class PdfEngine {
       pages.push({
         pageId: createId('pg'),
         orderKey,
-        widthPt: Math.round(viewport.width),
-        heightPt: Math.round(viewport.height),
+        widthPt: Number(viewport.width.toFixed(2)),
+        heightPt: Number(viewport.height.toFixed(2)),
         source: {
           kind: 'pdf',
           blobKey,

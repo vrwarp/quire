@@ -1,8 +1,10 @@
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -34,6 +36,73 @@ def make_sample_pdf(out_path: Path):
     fs.writeFileSync({str(out_path)!r}, bytes);
     """
     subprocess.run(["node", "--input-type=module", "-e", script], check=True)
+
+
+def measure_lined_page_png(png_bytes: bytes):
+    """Decode PNG bytes and return [(center_y_px, integrated_ink), ...] down the page center."""
+    pos = 8
+    idat = bytearray()
+    w = h = ctype = 0
+    while pos < len(png_bytes):
+        length, chunk_type = struct.unpack(">I4s", png_bytes[pos : pos + 8])
+        chunk = png_bytes[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if chunk_type == b"IHDR":
+            w, h, _, ctype, _, _, _ = struct.unpack(">IIBBBBB", chunk)
+        elif chunk_type == b"IDAT":
+            idat.extend(chunk)
+    raw = zlib.decompress(bytes(idat))
+    bpp = 4 if ctype == 6 else 3
+    stride = w * bpp
+    prev = bytearray(stride)
+    mid_x = w // 2
+    lum = []
+    idx = 0
+    for _ in range(h):
+        ft = raw[idx]
+        row = bytearray(raw[idx + 1 : idx + 1 + stride])
+        idx += 1 + stride
+        if ft == 1:
+            for i in range(bpp, stride):
+                row[i] = (row[i] + row[i - bpp]) & 0xFF
+        elif ft == 2:
+            for i in range(stride):
+                row[i] = (row[i] + prev[i]) & 0xFF
+        elif ft == 3:
+            for i in range(stride):
+                a = row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + ((a + prev[i]) >> 1)) & 0xFF
+        elif ft == 4:
+            for i in range(stride):
+                a = row[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                row[i] = (row[i] + pr) & 0xFF
+        prev = row
+        lum.append((row[mid_x * bpp] + row[mid_x * bpp + 1] + row[mid_x * bpp + 2]) / 3.0)
+
+    # 96% of vertical rows are pure paper background; 90th percentile gives exact paper lum for any slice
+    bg_samples = sorted(lum[12 : max(24, h - 12)])
+    bg_lum = bg_samples[int(len(bg_samples) * 0.9)]
+    lines = []
+    in_line = False
+    start = 0
+    for y in range(6, h - 6):
+        diff = bg_lum - lum[y]
+        if diff > 1.2:
+            if not in_line:
+                start = y
+                in_line = True
+        else:
+            if in_line:
+                ink = sum(max(0.0, bg_lum - lum[k]) for k in range(start, y))
+                cy = sum(k * max(0.0, bg_lum - lum[k]) for k in range(start, y)) / max(1e-6, ink)
+                lines.append((cy, ink))
+                in_line = False
+    return lines
 
 
 def main():
@@ -219,17 +288,21 @@ def main():
             assert wet_leftover == 0, f"Wet OffscreenCanvas left {wet_leftover} ghost pixels after pointerup!"
             print("[PASS] Wet OffscreenCanvas dirty-rect cleared to 0 ghost pixels after pen lift")
 
-            # Verify newly opened note defaults immediately to Fit Width (with side margins & zoom-scaled guide lines)!
+            # Verify newly opened note defaults immediately to Fit Width (with side margins & zoom-scaled SVG guide lines)!
             fit_metrics = page.evaluate("""() => {
                 const scroller = document.querySelector('#stage-scroller');
                 const slot = document.querySelector('.page-slot[data-page-index="0"]');
+                const svg = slot.querySelector('.page-template-svg');
                 const cs = getComputedStyle(slot);
                 return {
                     pressed: document.querySelector('#btn-zoom-fit-width')?.getAttribute('aria-pressed'),
                     scrollerW: scroller.clientWidth,
                     slotW: slot.getBoundingClientRect().width,
+                    slotH: slot.getBoundingClientRect().height,
+                    svgW: svg ? svg.getBoundingClientRect().width : 0,
+                    svgH: svg ? svg.getBoundingClientRect().height : 0,
+                    svgViewBox: svg ? svg.getAttribute('viewBox') : '',
                     zoomVar: parseFloat(cs.getPropertyValue('--page-zoom')),
-                    bgPosY: parseFloat(cs.backgroundPositionY),
                     zoomLabel: document.querySelector('#zoom-percent-label')?.textContent,
                     padBottom: parseFloat(getComputedStyle(scroller).paddingBottom),
                 };
@@ -237,12 +310,50 @@ def main():
             assert fit_metrics["pressed"] == "true", f"Expected Fit Width active on open: {fit_metrics}"
             margin_total = fit_metrics["scrollerW"] - fit_metrics["slotW"]
             assert 56 <= margin_total <= 96, f"Expected side margins ~72px total, got {margin_total:.1f}px ({fit_metrics})"
-            expected_bg_y = 56.0 * fit_metrics["zoomVar"]
-            assert abs(fit_metrics["bgPosY"] - expected_bg_y) < 1.5, (
-                f"Guide lines did not scale with zoom: bgPosY={fit_metrics['bgPosY']}, expected={expected_bg_y}"
+            assert fit_metrics["svgViewBox"] == "0 0 612 792", f"Unexpected template SVG viewBox: {fit_metrics}"
+            assert abs(fit_metrics["svgW"] - fit_metrics["slotW"]) < 1.0 and abs(fit_metrics["svgH"] - fit_metrics["slotH"]) < 1.0, (
+                f"Template SVG did not scale 1:1 with page slot: {fit_metrics}"
             )
             assert fit_metrics["padBottom"] >= 250, f"Expected generous bottom overscroll, got {fit_metrics['padBottom']}px"
-            print(f"[PASS] Default Fit Width ({fit_metrics['zoomLabel']}, {margin_total:.0f}px side margin, {fit_metrics['padBottom']:.0f}px bottom overscroll) verified")
+
+            # Pixel-level regression check on clean Lined Page 2 (top slice + bottom slice):
+            # 1) Zero large gap between 2nd & 3rd line (all consecutive line gaps uniform within <=1.2px)
+            # 2) Zero double-thick beat-aliasing lines (3rd from top AND 3rd from bottom within <=18% of median)
+            expected_step_px = 26.0 * fit_metrics["zoomVar"] * 2.0  # device_scale_factor = 2
+            for slice_align in ("start", "end"):
+                page.evaluate(
+                    f"""() => document.querySelector('.page-slot[data-page-index="1"]')?.scrollIntoView({{ block: '{slice_align}' }})"""
+                )
+                page.wait_for_timeout(60)
+                clean_lined_shot = page.locator('.page-slot[data-page-index="1"]').screenshot(
+                    style=".editor-header, .ink-toolbar, .thumb-pill, .audio-bar { visibility: hidden !important; }"
+                )
+                raw_lines = measure_lined_page_png(clean_lined_shot)
+                # Keep exact top lines (1st, 2nd, 3rd) on 'start' and exact bottom lines (3rd, 2nd, 1st) on 'end'
+                measured_lines = raw_lines[:-1] if slice_align == "start" else raw_lines[1:]
+                assert len(measured_lines) >= 10, (
+                    f"Expected >=10 visible ruled lines in {slice_align} slice, got {len(measured_lines)}"
+                )
+                line_gaps = [measured_lines[i][0] - measured_lines[i - 1][0] for i in range(1, len(measured_lines))]
+                assert max(line_gaps) - min(line_gaps) <= 1.2, (
+                    f"Inconsistent lined rule spacing in {slice_align} slice (gaps={line_gaps[:6]}): min={min(line_gaps):.2f}, max={max(line_gaps):.2f}"
+                )
+                assert abs((sum(line_gaps) / len(line_gaps)) - expected_step_px) < 0.8, (
+                    f"Mean line step {sum(line_gaps)/len(line_gaps):.2f}px != expected {expected_step_px:.2f}px"
+                )
+                line_inks = sorted(item[1] for item in measured_lines)
+                median_ink = line_inks[len(line_inks) // 2]
+                assert line_inks[-1] / max(1e-6, median_ink) < 1.18 and line_inks[0] / max(1e-6, median_ink) > 0.82, (
+                    f"Uncharacteristically thick/thin ruled lines in {slice_align} slice: min={line_inks[0]:.1f}, median={median_ink:.1f}, max={line_inks[-1]:.1f}"
+                )
+
+            # Restore scroll position back to top of Page 1 for subsequent interactive tool checks
+            page.evaluate("() => { document.querySelector('#stage-scroller').scrollTop = 0; }")
+            page.wait_for_timeout(80)
+            print(
+                f"[PASS] Default Fit Width ({fit_metrics['zoomLabel']}) & pixel-uniform Lined rules verified across top & bottom slices "
+                f"(gap={min(line_gaps):.2f}..{max(line_gaps):.2f}px, ink={line_inks[0]:.1f}..{line_inks[-1]:.1f})"
+            )
 
             # Verify Pinch-to-Zoom (Ctrl+Wheel trackpad pinch) zooms in & exits Fit Width, then snaps back magnetically
             page.evaluate("""() => {
