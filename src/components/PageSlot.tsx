@@ -11,6 +11,7 @@ import {
   appendDryPenStroke,
   renderDryHighlighterLayer,
   renderDryPenLayer,
+  resolveStrokeColor,
 } from '../engine/canvasRenderer';
 import { pdfEngine, type PdfLinkAnnotation } from '../engine/pdfEngine';
 import { quireStorage } from '../engine/storage';
@@ -29,6 +30,8 @@ interface PageSlotProps {
   pageIndex: number;
   zoom: number;
   isVisible: boolean;
+  effectivePaperTheme: PaperTheme;
+  invertPdf: boolean;
   activeTool: ToolKind;
   fingerDrawMode: boolean;
   strokes: VectorStroke[];
@@ -57,6 +60,8 @@ export function PageSlot({
   pageIndex,
   zoom,
   isVisible,
+  effectivePaperTheme,
+  invertPdf,
   activeTool,
   fingerDrawMode,
   strokes,
@@ -91,6 +96,7 @@ export function PageSlot({
     heightPt: number;
     scale: number;
     paperTheme: PaperTheme;
+    invertPdf: boolean;
   } | null>(null);
 
   const prevPenStateRef = useRef<{
@@ -106,10 +112,12 @@ export function PageSlot({
   const [pdfLinks, setPdfLinks] = useState<PdfLinkAnnotation[]>([]);
   const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
 
-  const paperTheme: PaperTheme = page.source.kind === 'template' ? page.source.theme : 'light';
+  const paperTheme: PaperTheme = effectivePaperTheme;
   const paperClass =
     page.source.kind === 'template'
-      ? `paper-theme-${page.source.theme} paper-tpl-${page.source.template}`
+      ? `paper-theme-${effectivePaperTheme} paper-tpl-${page.source.template}`
+      : invertPdf
+      ? 'pdf-night-canvas'
       : 'paper-theme-light';
 
   const scaledW = Math.round(page.widthPt * zoom);
@@ -131,7 +139,7 @@ export function PageSlot({
     [strokes, hiddenStrokeIds]
   );
 
-  const compositePdfWithHighlighters = useCallback((hasHighlighters: boolean) => {
+  const compositePdfWithHighlighters = useCallback((hasHighlighters: boolean, shouldInvert: boolean) => {
     const pdfCanvas = pdfCanvasRef.current;
     const bitmap = pdfBitmapRef.current;
     if (!pdfCanvas || !bitmap) return;
@@ -143,7 +151,9 @@ export function PageSlot({
     if (!ctx) return;
     ctx.globalCompositeOperation = 'source-over';
     ctx.drawImage(bitmap, 0, 0);
-    if (hasHighlighters && hlCanvasRef.current && hlCanvasRef.current.width > 0) {
+    // In Night Canvas PDF mode, keep highlighters on the separate un-inverted hlCanvasRef layer
+    // so CSS invert() on pdfCanvasRef does not invert highlighter hues.
+    if (!shouldInvert && hasHighlighters && hlCanvasRef.current && hlCanvasRef.current.width > 0) {
       ctx.save();
       ctx.globalCompositeOperation = 'multiply';
       ctx.drawImage(hlCanvasRef.current, 0, 0, pdfCanvas.width, pdfCanvas.height);
@@ -169,7 +179,7 @@ export function PageSlot({
     void pdfEngine.renderPageTile(blobKey, pdfPageNumber, renderScale, rotation).then((bitmap) => {
       if (cancelled || !bitmap || !pdfCanvasRef.current) return;
       pdfBitmapRef.current = bitmap;
-      compositePdfWithHighlighters((prevHlStateRef.current?.strokes.length ?? 0) > 0);
+      compositePdfWithHighlighters((prevHlStateRef.current?.strokes.length ?? 0) > 0, invertPdf);
     });
 
     void pdfEngine.getPageLinks(blobKey, pdfPageNumber).then((links) => {
@@ -179,7 +189,7 @@ export function PageSlot({
     return () => {
       cancelled = true;
     };
-  }, [isVisible, page.source, page.widthPt, page.heightPt, zoom, compositePdfWithHighlighters]);
+  }, [isVisible, page.source, page.widthPt, page.heightPt, zoom, invertPdf, compositePdfWithHighlighters]);
 
   // Synchronously commit Dry Highlighter + Dry Pen updates BEFORE the next browser paint frame
   // (avoids Preact useEffect's rAF + setTimeout 2-frame blink and skips untouched layers in O(1))
@@ -204,6 +214,7 @@ export function PageSlot({
         prevHl.heightPt === page.heightPt &&
         prevHl.scale === scale &&
         prevHl.paperTheme === paperTheme &&
+        prevHl.invertPdf === invertPdf &&
         sameStrokeRefs(prevHl.strokes, visibleHlStrokes);
 
       if (!hlUnchanged) {
@@ -221,9 +232,10 @@ export function PageSlot({
           heightPt: page.heightPt,
           scale,
           paperTheme,
+          invertPdf,
         };
         if (page.source.kind === 'pdf') {
-          compositePdfWithHighlighters(visibleHlStrokes.length > 0);
+          compositePdfWithHighlighters(visibleHlStrokes.length > 0, invertPdf);
         }
       }
     }
@@ -302,6 +314,7 @@ export function PageSlot({
     page.source.kind,
     zoom,
     paperTheme,
+    invertPdf,
     replaySessionId,
     replayTimeMs,
     compositePdfWithHighlighters,
@@ -382,7 +395,7 @@ export function PageSlot({
     >
       {isVisible && (
         <>
-          {page.source.kind === 'pdf' && <canvas ref={pdfCanvasRef} class="page-layer" />}
+          {page.source.kind === 'pdf' && <canvas ref={pdfCanvasRef} class="page-layer pdf-canvas-layer" />}
 
           {/* Embedded Croppable Images (FR-PDF-03) */}
           {images.map((img) => {
@@ -463,7 +476,7 @@ export function PageSlot({
           <canvas
             ref={hlCanvasRef}
             class="page-layer highlighter-layer"
-            style={page.source.kind === 'pdf' ? { display: 'none' } : undefined}
+            style={page.source.kind === 'pdf' && !invertPdf ? { display: 'none' } : undefined}
           />
 
           {/* Crisp Vector Dry Pen Canvas */}
@@ -573,7 +586,7 @@ export function PageSlot({
                     fontWeight: box.bold ? 700 : 400,
                     fontStyle: box.italic ? 'italic' : 'normal',
                     textDecoration: box.underline ? 'underline' : 'none',
-                    color: paperTheme === 'dark' ? '#f2efe9' : box.color,
+                    color: resolveStrokeColor(box.color, paperTheme, 'pen'),
                   }}
                   onInput={(e) => {
                     const value = (e.target as HTMLTextAreaElement).value;

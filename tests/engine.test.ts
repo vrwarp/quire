@@ -28,8 +28,18 @@ import {
 } from '../src/engine/storage';
 import { mergeNoteVersions } from '../src/engine/syncEngine';
 import { exportNoteToQuireBundle, exportNoteToVectorPdf } from '../src/engine/exportEngine';
+import { resolveStrokeColor } from '../src/engine/canvasRenderer';
+import {
+  THEME_META_COLORS,
+  THEME_STORAGE_KEY,
+  applyDocumentTheme,
+  nextThemeMode,
+  resolveEffectivePaperTheme,
+  resolveThemeMode,
+  shouldInvertPdfCanvas,
+} from '../src/engine/theme';
 import { ProMotionGovernor } from '../src/engine/promotion';
-import type { Folder, NoteDocument, StrokePoint, VectorStroke } from '../src/types';
+import type { Folder, NoteDocument, PageSource, StrokePoint, VectorStroke } from '../src/types';
 
 function makePt(x: number, y: number, dtMs = 0, pressure = 0.6): StrokePoint {
   return { x, y, pressure, altitude: Math.PI / 2, azimuth: 0, dtMs };
@@ -483,5 +493,118 @@ describe('Apple Pencil Low-Latency Pipeline (Kinematic Predictor & 240 Hz De-Qua
     }
   });
 });
+
+describe('Dark/Light Mode (Tier 1) & Non-Destructive Night Canvas (Tier 2)', () => {
+  it('resolves tri-state themeMode and cycles system -> light -> dark -> system', () => {
+    expect(resolveThemeMode('system', true)).toBe('dark');
+    expect(resolveThemeMode('system', false)).toBe('light');
+    expect(resolveThemeMode('light', true)).toBe('light');
+    expect(resolveThemeMode('dark', false)).toBe('dark');
+
+    expect(nextThemeMode('system')).toBe('light');
+    expect(nextThemeMode('light')).toBe('dark');
+    expect(nextThemeMode('dark')).toBe('system');
+  });
+
+  it('syncs document data-theme, colorScheme, meta theme-color, and localStorage bootstrap key', () => {
+    const meta = document.createElement('meta');
+    meta.id = 'meta-theme-color';
+    meta.name = 'theme-color';
+    meta.content = '#ebe6dc';
+    document.head.appendChild(meta);
+
+    applyDocumentTheme('dark', 'dark');
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(document.documentElement.style.colorScheme).toBe('dark');
+    expect(meta.getAttribute('content')).toBe(THEME_META_COLORS.dark);
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe('dark');
+
+    applyDocumentTheme('light', 'system');
+    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(document.documentElement.style.colorScheme).toBe('light');
+    expect(meta.getAttribute('content')).toBe(THEME_META_COLORS.light);
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe('system');
+
+    meta.remove();
+  });
+
+  it('computes non-destructive Night Canvas overrides for template pages and PDFs', () => {
+    const creamPage: PageSource = { kind: 'template', template: 'lined', theme: 'cream' };
+    const darkPage: PageSource = { kind: 'template', template: 'grid', theme: 'dark' };
+    const pdfPage: PageSource = {
+      kind: 'pdf',
+      blobKey: 'pdf_1',
+      pdfPageNumber: 1,
+      rotation: 0,
+      fileName: 'slides.pdf',
+    };
+
+    // Light UI never overrides paper or inverts PDFs (explicit dark paper stays dark)
+    expect(resolveEffectivePaperTheme(creamPage, 'light', 'paper-and-pdf')).toBe('cream');
+    expect(resolveEffectivePaperTheme(darkPage, 'light', 'off')).toBe('dark');
+    expect(resolveEffectivePaperTheme(pdfPage, 'light', 'paper-and-pdf')).toBe('light');
+    expect(shouldInvertPdfCanvas(pdfPage, 'light', 'paper-and-pdf')).toBe(false);
+
+    // Dark UI + Night Canvas 'off' preserves canonical paper & PDF
+    expect(resolveEffectivePaperTheme(creamPage, 'dark', 'off')).toBe('cream');
+    expect(shouldInvertPdfCanvas(pdfPage, 'dark', 'off')).toBe(false);
+
+    // Dark UI + Night Canvas 'paper' darkens template pages only
+    expect(resolveEffectivePaperTheme(creamPage, 'dark', 'paper')).toBe('dark');
+    expect(resolveEffectivePaperTheme(pdfPage, 'dark', 'paper')).toBe('light');
+    expect(shouldInvertPdfCanvas(pdfPage, 'dark', 'paper')).toBe(false);
+
+    // Dark UI + Night Canvas 'paper-and-pdf' darkens template pages AND inverts PDFs
+    expect(resolveEffectivePaperTheme(creamPage, 'dark', 'paper-and-pdf')).toBe('dark');
+    expect(resolveEffectivePaperTheme(pdfPage, 'dark', 'paper-and-pdf')).toBe('dark');
+    expect(shouldInvertPdfCanvas(pdfPage, 'dark', 'paper-and-pdf')).toBe(true);
+    expect(shouldInvertPdfCanvas(creamPage, 'dark', 'paper-and-pdf')).toBe(false);
+  });
+
+  it('semantically inverts neutral pen ink on dark paper while preserving colored pens and highlighters', () => {
+    expect(resolveStrokeColor('#18181b', 'dark', 'pen')).toBe('#f2efe9');
+    expect(resolveStrokeColor('#f2efe9', 'light', 'pen')).toBe('#18181b');
+    expect(resolveStrokeColor('#c85a32', 'dark', 'pen')).toBe('#c85a32');
+    expect(resolveStrokeColor('#facc15', 'dark', 'highlighter')).toBe('#facc15');
+  });
+
+  it('exports valid Vector PDF on dark paper with Screen highlighter blend mode', async () => {
+    const note = createNewNote(
+      { ...DEFAULT_SETTINGS, defaultPaperTheme: 'dark' },
+      null,
+      'Dark Paper Vector Export'
+    );
+    const pid = note.pages[0].pageId;
+    note.strokesByPage[pid] = [
+      {
+        id: createId('str'),
+        pageId: pid,
+        tool: 'highlighter',
+        color: '#facc15',
+        width: 18,
+        points: [makePt(40, 80), makePt(200, 80)],
+        bbox: computeBBox([makePt(40, 80), makePt(200, 80)]),
+      },
+      {
+        id: createId('str'),
+        pageId: pid,
+        tool: 'pen',
+        color: '#18181b',
+        width: 3,
+        points: [makePt(40, 80), makePt(200, 95)],
+        bbox: computeBBox([makePt(40, 80), makePt(200, 95)]),
+      },
+    ];
+    const pdfBytes = await exportNoteToVectorPdf(note, { includeBackground: true });
+    expect(pdfBytes.byteLength).toBeGreaterThan(800);
+    const parsed = await PDFDocument.load(pdfBytes);
+    expect(parsed.getPageCount()).toBe(1);
+    // Verify Screen blend mode is emitted in the PDF ExtGState for dark paper highlighters
+    const uncompressed = await parsed.save({ useObjectStreams: false });
+    const pdfText = new TextDecoder('latin1').decode(uncompressed);
+    expect(pdfText).toContain('/Screen');
+  });
+});
+
 
 

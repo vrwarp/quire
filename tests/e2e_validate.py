@@ -394,14 +394,79 @@ def main():
             assert page.locator(".note-card").count() == 2
             print("[PASS] Local-first persistence verified across full browser reload")
 
-            # --- CUJ 6: Settings Dark Mode + Non-Destructive Conflict Copy ---
+            # --- CUJ 6: Settings Dark Mode, Zero-FOUC Reload, Adaptive Swatch & Night Canvas (Tier 1 + Tier 2) ---
             page.click("#btn-open-settings")
-            page.click("#toggle-dark-mode")
+            page.click("#btn-theme-dark")
+            page.click("#btn-night-canvas-paper-and-pdf")
             page.click("#btn-test-conflict-sync")
             page.click('button[aria-label="Close Settings"]')
             assert page.locator(".note-card").count() == 3
+
+            dark_meta = page.evaluate("""() => ({
+                theme: document.documentElement.dataset.theme,
+                colorScheme: document.documentElement.style.colorScheme,
+                metaColor: document.getElementById('meta-theme-color')?.getAttribute('content'),
+                storedMode: localStorage.getItem('quire-theme-mode'),
+            })""")
+            assert dark_meta["theme"] == "dark", f"Expected dark theme, got {dark_meta}"
+            assert dark_meta["colorScheme"] == "dark", f"Expected dark colorScheme, got {dark_meta}"
+            assert dark_meta["metaColor"] == "#121418", f"Expected dark theme-color, got {dark_meta}"
+            assert dark_meta["storedMode"] == "dark", f"Expected storedMode=dark, got {dark_meta}"
             page.screenshot(path=str(SHOT_DIR / "05_library_dark_conflict.png"))
-            print("[PASS] CUJ 6 Dark Mode & Non-Destructive Conflict Copy verified")
+
+            # Reload and verify zero-FOUC dark theme persists immediately
+            page.reload(wait_until="networkidle")
+            page.wait_for_selector(".note-card", timeout=5000)
+            reloaded_theme = page.evaluate("() => document.documentElement.dataset.theme")
+            assert reloaded_theme == "dark", f"Expected dark theme after reload, got {reloaded_theme}"
+
+            # Open the cream template note in Night Canvas mode -> renders dark surface + adaptive off-white swatch
+            page.locator(".note-card", has_text="Physics 201 — Lecture 4").first.click()
+            page.wait_for_selector(".page-slot", timeout=3000)
+            night_paper = page.evaluate("""() => {
+                const slot = document.querySelector('.page-slot[data-page-index="0"]');
+                const primarySwatch = document.querySelector('.swatch-row .color-swatch');
+                return {
+                    cls: slot?.className || '',
+                    resolvedSwatch: primarySwatch?.getAttribute('data-resolved-color'),
+                };
+            }""")
+            assert "paper-theme-dark" in night_paper["cls"], f"Expected Night Canvas dark paper override: {night_paper}"
+            assert night_paper["resolvedSwatch"] == "#f2efe9", f"Expected adaptive off-white pen swatch: {night_paper}"
+
+            # Open the imported PDF note in Night Canvas Paper + PDFs mode -> inverted PDF canvas, un-inverted normal-blend highlighter
+            page.click("#btn-back-library")
+            page.wait_for_selector(".library-view")
+            page.locator(".note-card", has_text="sample_slides").first.click()
+            page.wait_for_selector(".page-slot.pdf-night-canvas", timeout=4000)
+            night_pdf = page.evaluate("""() => {
+                const pdfCanvas = document.querySelector('.pdf-night-canvas .pdf-canvas-layer');
+                const hlCanvas = document.querySelector('.pdf-night-canvas .highlighter-layer');
+                const primarySwatch = document.querySelector('.swatch-row .color-swatch');
+                return {
+                    pdfFilter: pdfCanvas ? getComputedStyle(pdfCanvas).filter : '',
+                    hlDisplay: hlCanvas ? getComputedStyle(hlCanvas).display : '',
+                    hlBlend: hlCanvas ? getComputedStyle(hlCanvas).mixBlendMode : '',
+                    resolvedSwatch: primarySwatch?.getAttribute('data-resolved-color'),
+                };
+            }""")
+            assert "invert(" in night_pdf["pdfFilter"], f"Expected CSS invert filter on PDF canvas: {night_pdf}"
+            assert night_pdf["hlDisplay"] != "none", f"Expected highlighter canvas visible in Night Canvas PDF mode: {night_pdf}"
+            assert night_pdf["hlBlend"] == "normal", f"Expected normal blend mode on PDF highlighter layer: {night_pdf}"
+            assert night_pdf["resolvedSwatch"] == "#f2efe9", f"Expected off-white pen swatch on inverted PDF: {night_pdf}"
+            page.screenshot(path=str(SHOT_DIR / "06_night_canvas_pdf.png"))
+
+            # Back to library and verify 1-tap quick theme cycler (dark -> system -> light -> dark)
+            page.click("#btn-back-library")
+            page.wait_for_selector("#btn-quick-theme")
+            page.click("#btn-quick-theme")  # dark -> system
+            assert page.evaluate("() => localStorage.getItem('quire-theme-mode')") == "system"
+            page.click("#btn-quick-theme")  # system -> light
+            assert page.evaluate("() => document.documentElement.dataset.theme") == "light"
+            assert page.evaluate("() => document.getElementById('meta-theme-color')?.getAttribute('content')") == "#ebe6dc"
+            page.click("#btn-quick-theme")  # light -> dark
+            assert page.evaluate("() => document.documentElement.dataset.theme") == "dark"
+            print("[PASS] CUJ 6 Tri-state Theme, Zero-FOUC Reload, Adaptive Swatch, Night Canvas (Paper + PDFs) & Conflict Copy verified")
 
             # --- Unlimited Note Creation (Zero Paywall / No Pro Gate) ---
             for _ in range(3):

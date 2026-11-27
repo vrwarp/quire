@@ -14,10 +14,12 @@ import {
 } from 'lucide-preact';
 import type {
   AppSettings,
+  NightCanvasMode,
   NoteDocument,
   PaperTemplate,
   PaperTheme,
   ScrollDirection,
+  ThemeMode,
   ToolbarDock,
 } from '../types';
 
@@ -547,20 +549,50 @@ export function SettingsModal({
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '16px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <h3 style={{ margin: 0, fontSize: '14px' }}>Appearance &amp; Ergonomics</h3>
-            <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '13.5px' }}>
-              <span>Dark Mode UI</span>
-              <input
-                id="toggle-dark-mode"
-                type="checkbox"
-                checked={settings.darkMode}
-                onChange={(e) =>
-                  onUpdateSettings({
-                    ...settings,
-                    darkMode: (e.target as HTMLInputElement).checked,
-                  })
-                }
-              />
-            </label>
+            <div class="field-group">
+              <label>Appearance</label>
+              <div class="option-grid">
+                {(['system', 'light', 'dark'] as ThemeMode[]).map((mode) => (
+                  <button
+                    key={mode}
+                    id={`btn-theme-${mode}`}
+                    type="button"
+                    aria-pressed={settings.themeMode === mode}
+                    class={`option-card ${settings.themeMode === mode ? 'selected' : ''}`}
+                    onClick={() => onUpdateSettings({ ...settings, themeMode: mode })}
+                  >
+                    {mode === 'system' ? 'System' : mode === 'light' ? 'Light' : 'Dark'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div class="field-group">
+              <label>Night Canvas (in Dark Mode)</label>
+              <div class="option-grid">
+                {(
+                  [
+                    { id: 'off', label: 'Off' },
+                    { id: 'paper', label: 'Paper Only' },
+                    { id: 'paper-and-pdf', label: 'Paper + PDFs' },
+                  ] as Array<{ id: NightCanvasMode; label: string }>
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    id={`btn-night-canvas-${opt.id}`}
+                    type="button"
+                    aria-pressed={settings.nightCanvasMode === opt.id}
+                    class={`option-card ${settings.nightCanvasMode === opt.id ? 'selected' : ''}`}
+                    onClick={() => onUpdateSettings({ ...settings, nightCanvasMode: opt.id })}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <span style={{ fontSize: '11.5px', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                Non-destructive view override. Exports always preserve original paper and PDF colors.
+              </span>
+            </div>
 
             <div class="field-group">
               <label>Toolbar Dock Position (Left/Right-Handed)</label>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   FileText,
   Grid,
@@ -28,6 +28,13 @@ import {
 import { generateOrderKey } from './engine/inkMath';
 import { pdfEngine } from './engine/pdfEngine';
 import { mergeNoteVersions, tickHLC } from './engine/syncEngine';
+import {
+  applyDocumentTheme,
+  getSystemPrefersDark,
+  nextThemeMode,
+  resolveEffectivePaperTheme,
+  resolveThemeMode,
+} from './engine/theme';
 import { LibrarySidebar, type LibraryFilter } from './components/LibrarySidebar';
 import { NoteEditor } from './components/NoteEditor';
 import {
@@ -82,10 +89,24 @@ export function App() {
     })();
   }, []);
 
-  // Sync dark mode attribute on <html>
+  const [systemPrefersDark, setSystemPrefersDark] = useState<boolean>(getSystemPrefersDark);
+
   useEffect(() => {
-    document.documentElement.dataset.theme = settings.darkMode ? 'dark' : 'light';
-  }, [settings.darkMode]);
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = (e: MediaQueryListEvent) => setSystemPrefersDark(e.matches);
+    setSystemPrefersDark(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  const resolvedTheme = resolveThemeMode(settings.themeMode, systemPrefersDark);
+
+  // Sync resolved theme + meta theme-color + localStorage bootstrap key synchronously before paint
+  useLayoutEffect(() => {
+    if (!hydrated) return;
+    applyDocumentTheme(resolvedTheme, settings.themeMode);
+  }, [hydrated, resolvedTheme, settings.themeMode]);
 
   const updateSettings = useCallback((next: AppSettings) => {
     setSettings(next);
@@ -518,6 +539,14 @@ export function App() {
         folders={folders}
         filter={filter}
         searchQuery={searchQuery}
+        themeMode={settings.themeMode}
+        onCycleTheme={() => {
+          const next = nextThemeMode(settings.themeMode);
+          updateSettings({ ...settings, themeMode: next });
+          showToast(
+            `Appearance: ${next === 'system' ? 'System' : next === 'light' ? 'Light' : 'Dark'}`
+          );
+        }}
         onSearchChange={setSearchQuery}
         onSelectFilter={(f) => {
           flushPendingSaves();
@@ -544,6 +573,7 @@ export function App() {
             key={activeNote.id}
             note={activeNote}
             settings={settings}
+            resolvedTheme={resolvedTheme}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
             onBackToLibrary={() => {
@@ -622,10 +652,17 @@ export function App() {
                 <div class={viewMode === 'grid' ? 'notes-grid' : 'notes-list'}>
                   {visibleLibraryNotes.map((n) => {
                     const firstPage = n.pages[0];
+                    const effectiveThumbTheme = firstPage
+                      ? resolveEffectivePaperTheme(
+                          firstPage.source,
+                          resolvedTheme,
+                          settings.nightCanvasMode
+                        )
+                      : 'light';
                     const thumbCls =
                       firstPage?.source.kind === 'template'
-                        ? `paper-theme-${firstPage.source.theme} paper-tpl-${firstPage.source.template}`
-                        : 'paper-theme-light';
+                        ? `paper-theme-${effectiveThumbTheme} paper-tpl-${firstPage.source.template}`
+                        : `paper-theme-${effectiveThumbTheme}`;
                     const isTrash = !!n.deletedAt;
 
                     return (

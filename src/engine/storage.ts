@@ -24,7 +24,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultTemplate: 'lined',
   defaultPaperTheme: 'cream',
   defaultScrollDirection: 'vertical',
-  darkMode: false,
+  themeMode: 'system',
+  nightCanvasMode: 'off',
   toolbarDock: 'top',
   fingerDrawMode: false,
   eraserSize: 'medium',
@@ -322,11 +323,22 @@ class QuireStorage {
     const cleanStored = { ...stored };
     delete cleanStored.pro;
     delete cleanStored.scribbleEraseEnabled;
+    const legacyDarkMode = typeof cleanStored.darkMode === 'boolean' ? cleanStored.darkMode : undefined;
+    delete cleanStored.darkMode;
     const schemaVer = typeof cleanStored.settingsVersion === 'number' ? cleanStored.settingsVersion : 1;
     delete cleanStored.settingsVersion;
+    const migratedTheme =
+      cleanStored.themeMode === 'system' ||
+      cleanStored.themeMode === 'light' ||
+      cleanStored.themeMode === 'dark'
+        ? cleanStored.themeMode
+        : legacyDarkMode === true
+        ? 'dark'
+        : DEFAULT_SETTINGS.themeMode;
     const merged: AppSettings = {
       ...DEFAULT_SETTINGS,
       ...(cleanStored as Partial<AppSettings>),
+      themeMode: migratedTheme,
       // One-time migration for pre-v2 sessions so single-finger touch pans natively by default
       ...(schemaVer < 2 ? { fingerDrawMode: false } : {}),
       backup: {
@@ -338,7 +350,7 @@ class QuireStorage {
         ...((stored.sync as Partial<AppSettings['sync']>) ?? {}),
       },
     };
-    if (schemaVer < 2) {
+    if (schemaVer < 3) {
       void this.saveSettings(merged);
     }
     return merged;
@@ -348,7 +360,7 @@ class QuireStorage {
     const db = await this.openDB();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_META, 'readwrite');
-      tx.objectStore(STORE_META).put({ ...settings, settingsVersion: 2 }, 'settings');
+      tx.objectStore(STORE_META).put({ ...settings, settingsVersion: 3 }, 'settings');
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
