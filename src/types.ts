@@ -90,6 +90,13 @@ export interface PageDescriptor {
   source: PageSource;
 }
 
+export interface PagePayload {
+  pageId: string;
+  strokes: VectorStroke[];
+  textBoxes: TextBoxItem[];
+  images: ImageItem[];
+}
+
 export interface AudioSegment {
   startMs: number;
   endMs: number;
@@ -120,7 +127,7 @@ export interface HLC {
   deviceId: string;
 }
 
-export interface NoteDocument {
+export interface NoteSummary {
   id: string;
   title: string;
   folderId: string | null;
@@ -131,29 +138,21 @@ export interface NoteDocument {
   updatedAt: number;
   deletedAt?: number | null;
   pages: PageDescriptor[];
-  strokesByPage: Record<string, VectorStroke[]>;
-  textBoxesByPage: Record<string, TextBoxItem[]>;
-  imagesByPage: Record<string, ImageItem[]>;
   audioSessions: AudioSession[];
   hlc: HLC;
 }
 
-export interface BackupConfig {
-  provider: 'none' | 'google-drive' | 'dropbox';
-  connectedAccount: string | null;
-  destinationFolder: string;
-  format: 'pdf' | 'quire';
-  wifiOnly: boolean;
-  lastBackupAt: number | null;
-  status: 'idle' | 'backing-up' | 'synced' | 'error';
-  errorMessage?: string;
+export interface NoteDocument extends NoteSummary {
+  strokesByPage: Record<string, VectorStroke[]>;
+  textBoxesByPage: Record<string, TextBoxItem[]>;
+  imagesByPage: Record<string, ImageItem[]>;
 }
 
-export interface SyncConfig {
-  enabled: boolean;
-  accountEmail: string | null;
-  lastSyncedAt: number | null;
-  status: 'local-only' | 'syncing' | 'synced' | 'conflict' | 'offline';
+export interface LocalBackupConfig {
+  lastBackupAt: number | null;
+  reminderIntervalDays: number; // 0 = off, 7 = weekly, 30 = monthly
+  localFolderName: string | null;
+  autoBackupLocalFolder: boolean;
 }
 
 export interface AppSettings {
@@ -169,10 +168,30 @@ export interface AppSettings {
   eraserAutoReturn: boolean;
   predictionLookaheadMs: number;
   audioPreRollMs: number;
+  showTelemetryHud: boolean;
+  lastOpenedNoteId: string | null;
   penColorPresets: string[];
   highlighterColorPresets: string[];
-  backup: BackupConfig;
-  sync: SyncConfig;
+  backup: LocalBackupConfig;
+}
+
+export interface StorageHealth {
+  backend: 'sqlite-opfs' | 'indexeddb-fallback';
+  privateModeWarning: boolean;
+  persisted: boolean;
+  usageBytes: number;
+  quotaBytes: number;
+  noteCount: number;
+  blobCount: number;
+  migratedFromV1: boolean;
+}
+
+export interface DiagnosticEntry {
+  ts: number;
+  level: 'info' | 'warn' | 'error';
+  source: string;
+  message: string;
+  detail?: string;
 }
 
 export interface UndoCommand {

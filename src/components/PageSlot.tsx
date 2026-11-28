@@ -91,6 +91,7 @@ export function PageSlot({
 }: PageSlotProps) {
   const slotRef = useRef<HTMLDivElement>(null);
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
+  const pdfSubTileCanvasRef = useRef<HTMLCanvasElement>(null);
   const hlCanvasRef = useRef<HTMLCanvasElement>(null);
   const penCanvasRef = useRef<HTMLCanvasElement>(null);
   const pdfBitmapRef = useRef<ImageBitmap | null>(null);
@@ -203,6 +204,62 @@ export function PageSlot({
     void pdfEngine.getPageLinks(blobKey, pdfPageNumber).then((links) => {
       if (!cancelled) setPdfLinks(links);
     });
+
+    // High-zoom crisp viewport sub-tile pass when zoom*dpr exceeds the 2400px full-page cap
+    const subCanvas = pdfSubTileCanvasRef.current;
+    if (subCanvas) {
+      if (zoom * dpr <= maxScaleForPage + 0.15) {
+        subCanvas.style.display = 'none';
+        subCanvas.width = 1;
+        subCanvas.height = 1;
+      } else {
+        const timer = window.setTimeout(() => {
+          if (cancelled || !slotRef.current || !pdfSubTileCanvasRef.current) return;
+          const rect = slotRef.current.getBoundingClientRect();
+          const visLeft = Math.max(0, -rect.left);
+          const visTop = Math.max(0, -rect.top);
+          const visRight = Math.min(rect.width, window.innerWidth - rect.left);
+          const visBottom = Math.min(rect.height, window.innerHeight - rect.top);
+          if (visRight - visLeft < 16 || visBottom - visTop < 16) return;
+
+          const targetScale = Math.min(zoom * dpr, 6);
+          const xPx = Math.floor(visLeft * dpr);
+          const yPx = Math.floor(visTop * dpr);
+          const wPx = Math.min(2048, Math.ceil((visRight - visLeft) * dpr));
+          const hPx = Math.min(2048, Math.ceil((visBottom - visTop) * dpr));
+
+          void pdfEngine
+            .renderPageSubTile(blobKey, pdfPageNumber, targetScale, rotation, {
+              xPx,
+              yPx,
+              wPx,
+              hPx,
+            })
+            .then((bmp) => {
+              if (!bmp) return;
+              if (cancelled || !pdfSubTileCanvasRef.current) {
+                bmp.close();
+                return;
+              }
+              const sc = pdfSubTileCanvasRef.current;
+              sc.width = bmp.width;
+              sc.height = bmp.height;
+              sc.style.display = 'block';
+              sc.style.left = `${visLeft}px`;
+              sc.style.top = `${visTop}px`;
+              sc.style.width = `${visRight - visLeft}px`;
+              sc.style.height = `${visBottom - visTop}px`;
+              const sctx = sc.getContext('2d');
+              sctx?.drawImage(bmp, 0, 0);
+              bmp.close();
+            });
+        }, 140);
+        return () => {
+          cancelled = true;
+          window.clearTimeout(timer);
+        };
+      }
+    }
 
     return () => {
       cancelled = true;
@@ -414,7 +471,16 @@ export function PageSlot({
     >
       {isVisible && (
         <>
-          {page.source.kind === 'pdf' && <canvas ref={pdfCanvasRef} class="page-layer pdf-canvas-layer" />}
+          {page.source.kind === 'pdf' && (
+            <>
+              <canvas ref={pdfCanvasRef} class="page-layer pdf-canvas-layer" />
+              <canvas
+                ref={pdfSubTileCanvasRef}
+                class="page-layer pdf-canvas-layer"
+                style={{ display: 'none', position: 'absolute', pointerEvents: 'none' }}
+              />
+            </>
+          )}
 
           {/* Embedded Croppable Images (FR-PDF-03) */}
           {images.map((img) => {

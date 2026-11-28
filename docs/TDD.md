@@ -2,12 +2,12 @@
 
 | Metadata Attribute | Specification |
 | :--- | :--- |
-| **Product** | **Quire** (Working Title — Web / Standalone PWA Architecture) |
-| **Target Release** | MVP v1.0 |
+| **Product** | **Quire** (Zero-Backend Local-First Web / Standalone PWA) |
+| **Target Release** | **v1.0 Production** |
 | **Primary Target** | **iPadOS 18.4+ Safari & Home Screen PWA** (Apple Pencil 240 Hz & ProMotion 120 Hz optimized) |
 | **Immediate Bonus Targets** | macOS, Windows (Surface Pen / Wacom), Android Tablets (S-Pen), Desktop Chrome/Edge/Firefox |
-| **Status** | Architecture & Engineering Design Proposal |
-| **Last Updated** | November 25, 2026 |
+| **Status** | Production v1.0 Architecture (Zero-Backend, Zero-Telemetry, Free Local-First) |
+| **Last Updated** | November 27, 2026 |
 
 ---
 
@@ -298,43 +298,38 @@ Two WebKit storage rules on iPadOS must be engineered around explicitly:
    - If the user signed in (Passkey / Sign in with Apple), Cloud Sync hydrates the installed PWA automatically.
    - Even *without* an account, clicking "Install to Home Screen" offers a 1-tap **"Transfer Notes Code / `.quire` Bundle"** handoff via short-lived encrypted relay token or Files export.
 
-### 7.3 Cloud Sync (Replacing CloudKit, `FR-SYN-01`) & Auto-Backup (`FR-SYN-02`)
-Instead of Apple-only CloudKit, Quire uses a **Local-First Delta Sync Protocol** backed by **Cloudflare Workers + Durable Objects / D1 (metadata) + Cloudflare R2 (immutable blobs)**:
-- **Zero Redundant Uploads**: Because PDFs, images, and closed `.m4a` chunks are content-addressed by `SHA-256`, adding 3 ink strokes to Slide 42 of an 80 MB PDF uploads **only the `~1.2 KB` `pageId.qbin` delta**—never re-uploading the PDF or audio!
-- **Non-Destructive Conflict Resolution (`CUJ 6`)**: Each `PageDescriptor` and `Note` carries a **Hybrid Logical Clock (HLC)** vector + `deviceId`.
-  - Edits to *different* pages offline on iPad and Mac merge automatically with zero conflict.
-  - Concurrent offline edits to the *same* page follow the PRD’s strict safety rule: **never silently overwrite ink**. If causal histories diverge on the same `pageId`, Quire preserves both by materializing `"Note Title — Conflict Copy [Device, Date]"` and surfacing a calm, non-blocking banner.
-- **Google Drive & Dropbox Auto-Backup (`FR-SYN-02`)**:
-  - Uses OAuth 2.0 PKCE with **Google Drive `drive.file` scope** (non-restricted scope—creates/updates a dedicated `/Quire Backups/...` folder mirroring the user’s 5-level folder tree without requiring intrusive full-drive access!) and **Dropbox `files.content.write`**.
-  - After edits settle (`30 s` debounce while online on Wi-Fi), `ExportWorker` generates the updated Vector PDF or `.quire` archive in the background and uploads via resumable `PUT` without touching foreground ink threads.
+### 7.3 Portable Full-Library Backup, Conflict-Safe Merge & Local Folder Auto-Backup
+Quire v1.0 ships as a **100% zero-backend, zero-telemetry, air-gapped local-first PWA** hosted statically on GitHub Pages (`/quire/`):
+- **Full-Library `.quire` Backup & Restore**: Exports all folders (up to 5 levels), settings, notes, and deduplicated PDF/image/audio blobs inside `ExportWorker` via streaming `fflate`, supporting 1-tap iPadOS System Share Sheet (`navigator.share({ files })`) to iCloud Drive, Files, or third-party cloud apps.
+- **Non-Destructive Conflict Resolution (`CUJ 6`)**: Each `Note` carries a **Hybrid Logical Clock (HLC)** vector + `deviceId`. When restoring or importing `.quire` archives across devices, divergent offline edits on the same page **never silently overwrite ink**—Quire preserves both by materializing `"Note Title — Conflict Copy [Device, Date]"`.
+- **Optional Local Folder Auto-Backup (Desktop Chromium)**: Via `window.showDirectoryPicker()`, desktop users can write `.quire` backups directly into a local synced folder (e.g., iCloud Drive, Google Drive Desktop, or Dropbox folder) with zero cloud OAuth servers.
+- **Single-Active-Window OPFS Lock Handoff**: `WindowLockCoordinator` (`BroadcastChannel`) coordinates exclusive `opfs-sahpool` SQLite ownership across tabs, cleanly pausing background tabs and resuming on focus.
 
 ### 7.4 True Vector PDF Export (`FR-SYN-03`)
 Rasterizing ink to bitmaps ruins PDF export quality. Inside `ExportWorker`:
-1. Load the original imported PDF bytes from OPFS into `pdf-lib` (preserving 100% of native PDF vector text, embedded fonts, and clickable links) or create blank pages matching `widthPt × heightPt`.
+1. Load the original imported PDF bytes from OPFS into `pdf-lib` (preserving 100% of native PDF vector text, embedded fonts, and clickable links; password-protected PDFs are unlocked locally via PDFium on import) or create blank pages matching `widthPt × heightPt`.
 2. Optionally emit vector lines/dots/grids for paper templates (`RG`, `w`, `m`, `l`, `S` PDF operators).
-3. Emit **Highlighter paths** inside a PDF Transparency Group with an Extended Graphics State (`/BM /Multiply`, `/ca 0.32`) so overlapping passes don’t darken and underlying PDF text stays selectable and crisp!
-4. Convert each **Pen stroke’s** variable-width outline ribbon into closed **cubic Bézier PDF paths** (`m`, `c`, `h`, `f` operators) — giving infinite vector zoom sharpness at tiny file sizes!
+3. Emit **Highlighter paths** grouped by color inside an isolated PDF Knockout Transparency Group (`/Group << /S /Transparency /I true /K true >>`, `/BM /Multiply` or `/Screen`) so overlapping passes never darken and underlying PDF text stays selectable and crisp.
+4. Convert each **Pen stroke’s** variable-width outline ribbon into closed **cubic Bézier PDF paths** (`m`, `c`, `h`, `f` operators) for infinite vector zoom sharpness.
+5. Embed a subsetted Unicode TrueType font (`DejaVuSans.ttf` via `@pdf-lib/fontkit`) for math/Greek/Latin/Cyrillic symbols, with automatic 3x DPI PNG fallback for CJK/emoji lines so Unicode text never crashes export.
 
 ---
 
-## 8. Cold Launch (`<1.5 s`), Monetization (`CUJ 7`) & Verification Plan
+## 8. Cold Launch (`<1.5 s`), Zero-Paywall Posture & Verification Plan
 
 ### 8.1 Cold Launch Critical Path (`<1.5 s` on iPad Air M1+)
 ```mermaid
 flowchart LR
-    T0["0 ms: Tap PWA Icon"] --> T1["80 ms: Service Worker serves<br/>precached HTML + CSS + 45KB JS"]
-    T1 --> T2["220 ms: Optimistic Blank/Last Note<br/>Canvas & Toolbar Paint (Writable!)"]
-    T2 --> T3["380 ms: InkRenderWorker WebGPU<br/>OffscreenCanvas Ready (<0.4s!)"]
-    T2 --> T4["650 ms: StorageSyncWorker OPFS +<br/>SQLite Hydrates Library & Dry Tiles"]
+    T0["0 ms: Tap PWA Icon"] --> T1["80 ms: Workbox Tier-1 serves<br/>precached HTML + CSS + ~63KB gz JS"]
+    T1 --> T2["220 ms: Optimistic Note<br/>Canvas & Toolbar Paint (Writable!)"]
+    T2 --> T3["350 ms: InkRenderWorker 2D<br/>OffscreenCanvas Ready (<0.4s!)"]
+    T2 --> T4["600 ms: StorageSyncWorker SQLite<br/>OPFS Hydrates Summaries & Dry Tiles"]
 ```
-- **Early-Stroke Buffering**: Just like native Apple Notes Instant Paper, `InputRouter` attaches stylus listeners at **`t = 220 ms`**—if Maya touches her Apple Pencil down at `t = 300 ms` while `InkRenderWorker` is finishing shader compilation (`t = 380 ms`), those 240 Hz points are buffered in memory and rendered at `t = 380 ms` with **zero dropped initial points (`CUJ 1`)**.
+- **Two-Tier Offline Caching**: Workbox (`vite-plugin-pwa`) eagerly precaches the App Shell, `InkRenderWorker`, and `StorageSyncWorker` (`sqlite3.wasm`) at install time, then warms `PDFium-WASM` and `DejaVuSans.ttf` in `requestIdleCallback` for 100% offline readiness without slowing cold launch.
 
-### 8.2 Respectful Free-to-Pro Monetization (`CUJ 7`)
-- **Free Tier**: Full ink, PDF import, and audio sync across **5 notes**, zero watermarks, zero launch-time upgrade modals, and existing 5 notes remain **100% editable and exportable forever** even if the user never upgrades.
-- **One-Time Pro Unlock (\$14.99–\$19.99)**:
-  - Triggered *only* when tapping `+ New Note` for a 6th note or toggling Cloud Sync / Auto-Backup.
-  - Powered by **Stripe Checkout / Payment Element with Apple Pay on the Web** — pops up the native iPadOS Face ID / Touch ID Apple Pay sheet in 1 tap (retaining ~97% revenue vs. 70%–85% on StoreKit).
-  - **Offline-First Entitlement**: Upon payment, the backend signs an **Ed25519 License Receipt (`quire_pro_v1` JWT)** verified locally via WebCrypto’s public key and stored in OPFS. Reinstalling or switching devices restores Pro instantly via **Sign in with Apple / Passkey / Email Magic Link**.
+### 8.2 Free, Zero-Paywall, Zero-Telemetry Posture
+- **100% Free & Local-First**: Unlimited notes, unlimited PDF imports, full audio sync, and lossless Vector PDF / PNG / `.quire` exports with zero accounts, zero paywalls, and strict `<meta>` CSP (`connect-src 'self' blob: data:`).
+- **Offline Diagnostics**: An `ErrorBoundary` with 1-tap emergency `.quire` library backup and a bounded local Diagnostics & Crash Log viewer/exporter in Settings allow safe bug reporting without any third-party telemetry SDKs.
 
 ### 8.3 Engineering Phasing & Risk Mitigations
 

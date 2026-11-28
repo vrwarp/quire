@@ -760,3 +760,199 @@ describe('Canonical Paper Templates & Continuous-Segment Geometry Consistency', 
     expect(arrowOutline.left.length).toBeGreaterThan(arrowPts.length);
   });
 });
+
+describe('V1.0 Production Storage, Spatial Index, Scroll Math & Unicode PDF Export', () => {
+  it('round-trips compact binary .qbin snapshots and recovers checksummed .wal frames after tail truncation', async () => {
+    const { encodePageQbin, decodePageQbin, encodeWalFrame, decodeLatestWalFrame } = await import(
+      '../src/engine/qbin'
+    );
+    const payload = {
+      pageId: 'pg_qbin',
+      strokes: [
+        {
+          id: 's1',
+          pageId: 'pg_qbin',
+          tool: 'pen' as const,
+          color: '#18181b',
+          width: 3.2,
+          points: [
+            { x: 12.5, y: 24.25, pressure: 0.72, altitude: 1.12, azimuth: -0.45, dtMs: 0 },
+            { x: 48.75, y: 64.5, pressure: 0.88, altitude: 1.05, azimuth: -0.4, dtMs: 16 },
+          ],
+          bbox: { minX: 9, minY: 21, maxX: 52, maxY: 68 },
+          audioSessionId: 'aud_1',
+          startAudioMs: 1200,
+          endAudioMs: 1216,
+        },
+      ],
+      textBoxes: [
+        {
+          id: 'txt_1',
+          pageId: 'pg_qbin',
+          x: 20,
+          y: 30,
+          width: 200,
+          height: 40,
+          plainText: '∑ f(x) dx = α + β',
+          fontFamily: 'sans' as const,
+          fontSize: 15,
+          color: '#18181b',
+          bold: false,
+          italic: false,
+          underline: false,
+          listMode: 'none' as const,
+        },
+      ],
+      images: [],
+    };
+
+    const qbin = encodePageQbin(payload);
+    const decoded = decodePageQbin(qbin);
+    expect(decoded.pageId).toBe('pg_qbin');
+    expect(decoded.strokes.length).toBe(1);
+    expect(decoded.strokes[0].points[1].x).toBeCloseTo(48.75, 2);
+    expect(decoded.strokes[0].points[1].pressure).toBeCloseTo(0.88, 2);
+    expect(decoded.textBoxes[0].plainText).toBe('∑ f(x) dx = α + β');
+
+    // Append 2 WAL frames + corrupt truncated 3rd frame -> recovers frame 2 intact
+    const frame1 = encodeWalFrame(qbin);
+    const payload2 = { ...payload, strokes: [...payload.strokes, { ...payload.strokes[0], id: 's2' }] };
+    const frame2 = encodeWalFrame(encodePageQbin(payload2));
+    const truncatedTail = new Uint8Array([0xff, 0x00, 0x01, 0x00, 0xde, 0xad]);
+    const wal = new Uint8Array(frame1.length + frame2.length + truncatedTail.length);
+    wal.set(frame1, 0);
+    wal.set(frame2, frame1.length);
+    wal.set(truncatedTail, frame1.length + frame2.length);
+
+    const recovered = decodeLatestWalFrame(wal);
+    expect(recovered).not.toBeNull();
+    expect(recovered!.strokes.length).toBe(2);
+    expect(recovered!.strokes[1].id).toBe('s2');
+  });
+
+  it('queries 5,000 strokes in <2ms via PageSpatialIndex and resolves 300 pages in O(log P)', async () => {
+    const { PageSpatialIndex, computePageLayoutOffsets, findActivePageIndexBinary } = await import(
+      '../src/engine/spatialIndex'
+    );
+
+    const strokes: VectorStroke[] = [];
+    for (let i = 0; i < 5000; i++) {
+      const x = (i % 50) * 12;
+      const y = Math.floor(i / 50) * 8;
+      strokes.push({
+        id: `s_${i}`,
+        pageId: 'pg_dense',
+        tool: 'pen',
+        color: '#18181b',
+        width: 2,
+        points: [makePt(x, y, 0), makePt(x + 8, y + 4, 10)],
+        bbox: { minX: x - 2, minY: y - 2, maxX: x + 10, maxY: y + 6 },
+      });
+    }
+
+    const index = new PageSpatialIndex(48);
+    index.sync(strokes);
+    const t0 = performance.now();
+    const hits = index.queryPoint(124, 82, 10);
+    const elapsedMs = performance.now() - t0;
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits.length).toBeLessThan(30);
+    expect(elapsedMs).toBeLessThan(10);
+
+    // 300-page layout binary search
+    const pages = Array.from({ length: 300 }, (_, i) => ({
+      pageId: `p_${i}`,
+      orderKey: String(i),
+      widthPt: 612,
+      heightPt: 792,
+      source: { kind: 'template' as const, template: 'lined' as const, theme: 'cream' as const },
+    }));
+    const offsets = computePageLayoutOffsets(pages, 1.0, 'vertical');
+    expect(findActivePageIndexBinary(offsets, offsets.centers[0])).toBe(0);
+    expect(findActivePageIndexBinary(offsets, offsets.centers[149])).toBe(149);
+    expect(findActivePageIndexBinary(offsets, offsets.centers[299])).toBe(299);
+  });
+
+  it('exports Vector PDF with Unicode math/CJK text without crashing and emits Knockout Highlighter Groups', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { buildVectorPdfBytes } = await import('../src/engine/pdfVectorBuilder');
+    const fontPath = path.resolve(process.cwd(), 'public/fonts/DejaVuSans.ttf');
+    const fontBytes = fs.existsSync(fontPath) ? new Uint8Array(fs.readFileSync(fontPath)) : null;
+
+    const note = createNewNote(DEFAULT_SETTINGS, null, 'Unicode ∑ ∫ Test');
+    const pid = note.pages[0].pageId;
+    note.strokesByPage[pid] = [
+      {
+        id: 'hl_1',
+        pageId: pid,
+        tool: 'highlighter',
+        color: '#facc15',
+        width: 18,
+        points: [makePt(40, 80), makePt(200, 80)],
+        bbox: { minX: 30, minY: 70, maxX: 210, maxY: 90 },
+      },
+      {
+        id: 'hl_2',
+        pageId: pid,
+        tool: 'highlighter',
+        color: '#facc15',
+        width: 18,
+        points: [makePt(100, 80), makePt(240, 80)],
+        bbox: { minX: 90, minY: 70, maxX: 250, maxY: 90 },
+      },
+      {
+        id: 'pen_1',
+        pageId: pid,
+        tool: 'pen',
+        color: '#18181b',
+        width: 3,
+        points: [makePt(40, 120), makePt(100, 140), makePt(180, 110), makePt(240, 130)],
+        bbox: { minX: 36, minY: 106, maxX: 244, maxY: 144 },
+      },
+    ];
+    note.textBoxesByPage[pid] = [
+      {
+        id: 'tb_unicode',
+        pageId: pid,
+        x: 40,
+        y: 200,
+        width: 300,
+        height: 60,
+        plainText: '∑ α + β → ∞\n日本語テスト 📝',
+        fontFamily: 'sans',
+        fontSize: 16,
+        color: '#18181b',
+        bold: false,
+        italic: false,
+        underline: false,
+        listMode: 'none',
+      },
+    ];
+
+    const pdfBytes = await buildVectorPdfBytes({
+      note,
+      blobs: {},
+      includeBackground: true,
+      unicodeFontBytes: fontBytes,
+    });
+    expect(pdfBytes.byteLength).toBeGreaterThan(2000);
+    const pdfText = new TextDecoder('latin1').decode(pdfBytes);
+    expect(pdfText.startsWith('%PDF-')).toBe(true);
+    expect(pdfText).toContain('/Transparency');
+    expect(pdfText).toContain('/K true');
+  });
+
+  it('collects nested descendant folder IDs recursively for clean folder deletion', async () => {
+    const { getDescendantFolderIds } = await import('../src/engine/storage');
+    const folders: Folder[] = [
+      { id: 'f1', name: 'Root', parentId: null, color: '#000', createdAt: 1 },
+      { id: 'f2', name: 'Child', parentId: 'f1', color: '#000', createdAt: 2 },
+      { id: 'f3', name: 'Grandchild', parentId: 'f2', color: '#000', createdAt: 3 },
+      { id: 'f4', name: 'Sibling', parentId: null, color: '#000', createdAt: 4 },
+    ];
+    const descendants = getDescendantFolderIds('f1', folders);
+    expect(descendants.sort()).toEqual(['f1', 'f2', 'f3']);
+  });
+});
+

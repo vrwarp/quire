@@ -1,26 +1,22 @@
-import * as pdfjsLib from 'pdfjs-dist';
-import pdfjsWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import type { PageDescriptor } from '../types';
 import { createId, quireStorage } from './storage';
 import { generateOrderKey } from './inkMath';
+import { logDiagnostic } from './diagnostics';
+import type {
+  PdfWorkerLink,
+  PdfWorkerRequest,
+  PdfWorkerResponse,
+  PdfWorkerSubRect,
+} from '../workers/pdf.worker';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
-
-export interface PdfLinkAnnotation {
-  rectPt: [number, number, number, number]; // [x, y, w, h] in top-left page points
-  destPageNumber?: number;
-  url?: string;
-}
+export type PdfLinkAnnotation = PdfWorkerLink;
+export type PdfSubRect = PdfWorkerSubRect;
 
 export interface PdfImportResult {
   blobKey: string;
   pages: PageDescriptor[];
   pageCount: number;
-}
-
-interface CachedDoc {
-  doc: pdfjsLib.PDFDocumentProxy;
-  lastUsed: number;
+  wasEncryptedUnlocked: boolean;
 }
 
 interface CachedTile {
@@ -28,22 +24,105 @@ interface CachedTile {
   lastUsed: number;
 }
 
+interface WorkerSlot {
+  worker: Worker;
+  rpcId: number;
+  pending: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>;
+  knownBlobs: Set<string>;
+}
+
 /**
- * Memory-Bounded Lazy PDF Tile Engine (FR-PDF-01, FR-PDF-02, FR-PDF-05).
+ * Memory-Bounded PDFium-WASM Tile Engine (2-Worker Pool — TDD §2 & §5.1).
  *
- * - Keeps at most 20 rendered page ImageBitmaps in memory (explicitly calling `bitmap.close()`
- *   on LRU eviction) so 100–300 page PDFs stay well below the 350 MB iPad RAM ceiling.
- * - Handles password-protected PDFs cleanly via `onPassword` callback.
- * - Extracts internal PDF hyperlinks and external URLs for Read/Pan mode navigation.
+ * - Spawns up to 2 dedicated `PDFTileWorker`s running PDFium-WASM for parallel
+ *   off-main-thread page rasterization & zoomed viewport sub-tiles.
+ * - Unlocks password-protected PDFs via PDFium at import time so reloads & vector
+ *   exports work seamlessly without storing plaintext passwords.
+ * - Enforces a strict 16-tile `ImageBitmap` LRU (`bitmap.close()` on eviction) and
+ *   automatically trims worker & tile caches on `visibilitychange === 'hidden'`.
  */
 class PdfEngine {
-  private docCache = new Map<string, CachedDoc>();
+  private pool: WorkerSlot[] = [];
+  private nextWorkerIdx = 0;
+  private readonly poolSize = 2;
   private tileCache = new Map<string, CachedTile>();
-  private readonly maxCachedTiles = 20;
-  private readonly maxCachedDocs = 4;
+  private inFlightTiles = new Map<string, Promise<ImageBitmap | null>>();
+  private readonly maxCachedTiles = 16;
+  private visibilityAttached = false;
 
   get cachedTileCount(): number {
     return this.tileCache.size;
+  }
+
+  private ensureVisibilityTrim(): void {
+    if (this.visibilityAttached || typeof document === 'undefined') return;
+    this.visibilityAttached = true;
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        this.trimMemoryForBackground();
+      }
+    });
+  }
+
+  private ensurePool(): WorkerSlot[] {
+    this.ensureVisibilityTrim();
+    if (this.pool.length > 0) return this.pool;
+    if (typeof Worker === 'undefined') {
+      throw new Error('PDFTileWorker requires Web Workers');
+    }
+    for (let i = 0; i < this.poolSize; i++) {
+      const worker = new Worker(new URL('../workers/pdf.worker.ts', import.meta.url), {
+        type: 'module',
+        name: `quire-pdf-worker-${i}`,
+      });
+      const slot: WorkerSlot = {
+        worker,
+        rpcId: 0,
+        pending: new Map(),
+        knownBlobs: new Set(),
+      };
+      worker.onmessage = (ev: MessageEvent<PdfWorkerResponse>) => {
+        const { id, ok, result, error } = ev.data;
+        const entry = slot.pending.get(id);
+        if (!entry) return;
+        slot.pending.delete(id);
+        if (ok) entry.resolve(result);
+        else entry.reject(new Error(error || 'PDFTileWorker RPC failed'));
+      };
+      worker.onerror = (ev) => {
+        logDiagnostic('error', 'pdf.worker', `PDFTileWorker ${i} error`, ev.message);
+      };
+      this.pool.push(slot);
+    }
+    return this.pool;
+  }
+
+  private pickSlot(blobKey?: string): WorkerSlot {
+    const pool = this.ensurePool();
+    if (blobKey) {
+      // Prefer a worker that already has this PDF open to avoid re-sending bytes
+      const existing = pool.find((s) => s.knownBlobs.has(blobKey));
+      if (existing) return existing;
+    }
+    const slot = pool[this.nextWorkerIdx % pool.length];
+    this.nextWorkerIdx = (this.nextWorkerIdx + 1) % pool.length;
+    return slot;
+  }
+
+  private callSlot<T>(
+    slot: WorkerSlot,
+    method: PdfWorkerRequest['method'],
+    params?: Record<string, unknown>,
+    transfer: Transferable[] = []
+  ): Promise<T> {
+    const id = ++slot.rpcId;
+    return new Promise<T>((resolve, reject) => {
+      slot.pending.set(id, {
+        resolve: (v) => resolve(v as T),
+        reject,
+      });
+      slot.worker.postMessage({ id, method, params } satisfies PdfWorkerRequest, transfer);
+    });
   }
 
   async importPdfBytes(
@@ -55,57 +134,45 @@ class PdfEngine {
       throw new Error('PDF exceeds 200 MB safety limit. Please split or compress the PDF first.');
     }
 
-    const loadingTask = pdfjsLib.getDocument({
-      data: bytes.slice(),
-      password,
-    });
+    const slot = this.pickSlot();
+    const copy = new Uint8Array(bytes);
+    const inspected = await this.callSlot<{
+      pageCount: number;
+      dims: Array<{ widthPt: number; heightPt: number }>;
+      unlockedBytes: Uint8Array | null;
+    }>(slot, 'inspectAndUnlock', { bytes: copy, password: password ?? '' }, [copy.buffer]);
 
-    const pdfDoc = await loadingTask.promise;
+    const finalBytes = inspected.unlockedBytes ?? bytes;
     const blobKey = `pdf_${createId('blob')}`;
-    await quireStorage.saveBlob(blobKey, bytes);
-
-    this.docCache.set(blobKey, { doc: pdfDoc, lastUsed: Date.now() });
-    this.evictDocsIfNeeded();
+    await quireStorage.saveBlob(blobKey, finalBytes);
 
     const pages: PageDescriptor[] = [];
     let prevOrder: string | null = null;
-
-    // Fast metadata pass: read page dimensions lazily without rasterizing pixels
-    for (let i = 1; i <= pdfDoc.numPages; i++) {
-      const page = await pdfDoc.getPage(i);
-      const viewport = page.getViewport({ scale: 1 });
+    for (let i = 0; i < inspected.pageCount; i++) {
+      const d = inspected.dims[i] ?? { widthPt: 612, heightPt: 792 };
       const orderKey = generateOrderKey(prevOrder, null);
       prevOrder = orderKey;
       pages.push({
         pageId: createId('pg'),
         orderKey,
-        widthPt: Number(viewport.width.toFixed(2)),
-        heightPt: Number(viewport.height.toFixed(2)),
+        widthPt: d.widthPt,
+        heightPt: d.heightPt,
         source: {
           kind: 'pdf',
           blobKey,
-          pdfPageNumber: i,
+          pdfPageNumber: i + 1,
           rotation: 0,
           fileName,
         },
       });
     }
 
-    return { blobKey, pages, pageCount: pdfDoc.numPages };
-  }
-
-  private async getDocument(blobKey: string): Promise<pdfjsLib.PDFDocumentProxy | null> {
-    const cached = this.docCache.get(blobKey);
-    if (cached) {
-      cached.lastUsed = Date.now();
-      return cached.doc;
-    }
-    const bytes = await quireStorage.loadBlob(blobKey);
-    if (!bytes) return null;
-    const doc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
-    this.docCache.set(blobKey, { doc, lastUsed: Date.now() });
-    this.evictDocsIfNeeded();
-    return doc;
+    return {
+      blobKey,
+      pages,
+      pageCount: inspected.pageCount,
+      wasEncryptedUnlocked: Boolean(inspected.unlockedBytes),
+    };
   }
 
   async renderPageTile(
@@ -114,7 +181,7 @@ class PdfEngine {
     scale: number,
     rotation: 0 | 90 | 180 | 270 = 0
   ): Promise<ImageBitmap | null> {
-    const quantizedScale = Math.round(scale * 4) / 4;
+    const quantizedScale = Math.max(0.25, Math.round(scale * 4) / 4);
     const cacheKey = `${blobKey}:${pdfPageNumber}:${quantizedScale}:${rotation}`;
     const existing = this.tileCache.get(cacheKey);
     if (existing) {
@@ -122,73 +189,112 @@ class PdfEngine {
       return existing.bitmap;
     }
 
-    const doc = await this.getDocument(blobKey);
-    if (!doc) return null;
+    const inFlight = this.inFlightTiles.get(cacheKey);
+    if (inFlight) return inFlight;
 
-    const page = await doc.getPage(pdfPageNumber);
-    const viewport = page.getViewport({ scale: quantizedScale, rotation });
-    const w = Math.max(1, Math.round(viewport.width));
-    const h = Math.max(1, Math.round(viewport.height));
+    const promise = (async (): Promise<ImageBitmap | null> => {
+      try {
+        const slot = this.pickSlot(blobKey);
+        let res = await this.callSlot<{ bitmap?: ImageBitmap; needsBytes?: boolean } | null>(
+          slot,
+          'renderTile',
+          { blobKey, pageNumber: pdfPageNumber, scale: quantizedScale, rotation }
+        );
+        if (res && res.needsBytes) {
+          const bytes = await quireStorage.loadBlob(blobKey);
+          if (!bytes) return null;
+          const transferCopy = new Uint8Array(bytes);
+          res = await this.callSlot<{ bitmap?: ImageBitmap } | null>(
+            slot,
+            'renderTile',
+            {
+              blobKey,
+              bytes: transferCopy,
+              pageNumber: pdfPageNumber,
+              scale: quantizedScale,
+              rotation,
+            },
+            [transferCopy.buffer]
+          );
+          slot.knownBlobs.add(blobKey);
+        }
+        const bitmap = res?.bitmap ?? null;
+        if (bitmap) {
+          this.tileCache.set(cacheKey, { bitmap, lastUsed: Date.now() });
+          this.evictTilesIfNeeded();
+        }
+        return bitmap;
+      } catch (err) {
+        logDiagnostic('warn', 'pdfEngine', `Tile render failed p.${pdfPageNumber}`, err);
+        return null;
+      } finally {
+        this.inFlightTiles.delete(cacheKey);
+      }
+    })();
 
-    let bitmap: ImageBitmap;
-    if (typeof OffscreenCanvas !== 'undefined') {
-      const offscreen = new OffscreenCanvas(w, h);
-      const ctx = offscreen.getContext('2d');
-      if (!ctx) return null;
-      await page.render({
-        canvasContext: ctx as unknown as CanvasRenderingContext2D,
-        viewport,
-        canvas: offscreen as unknown as HTMLCanvasElement,
-      }).promise;
-      bitmap = offscreen.transferToImageBitmap();
-    } else {
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return null;
-      await page.render({ canvasContext: ctx, viewport, canvas }).promise;
-      bitmap = await createImageBitmap(canvas);
+    this.inFlightTiles.set(cacheKey, promise);
+    return promise;
+  }
+
+  /**
+   * Renders a crisp high-DPI viewport sub-tile when zoomed in (>2x), avoiding the 2400px full-page blur cap.
+   */
+  async renderPageSubTile(
+    blobKey: string,
+    pdfPageNumber: number,
+    scale: number,
+    rotation: 0 | 90 | 180 | 270,
+    subRect: PdfSubRect
+  ): Promise<ImageBitmap | null> {
+    try {
+      const slot = this.pickSlot(blobKey);
+      let res = await this.callSlot<{ bitmap?: ImageBitmap; needsBytes?: boolean } | null>(
+        slot,
+        'renderTile',
+        { blobKey, pageNumber: pdfPageNumber, scale, rotation, subRect }
+      );
+      if (res && res.needsBytes) {
+        const bytes = await quireStorage.loadBlob(blobKey);
+        if (!bytes) return null;
+        const copy = new Uint8Array(bytes);
+        res = await this.callSlot<{ bitmap?: ImageBitmap } | null>(
+          slot,
+          'renderTile',
+          { blobKey, bytes: copy, pageNumber: pdfPageNumber, scale, rotation, subRect },
+          [copy.buffer]
+        );
+        slot.knownBlobs.add(blobKey);
+      }
+      return res?.bitmap ?? null;
+    } catch {
+      return null;
     }
-
-    this.tileCache.set(cacheKey, { bitmap, lastUsed: Date.now() });
-    this.evictTilesIfNeeded();
-    return bitmap;
   }
 
   async getPageLinks(blobKey: string, pdfPageNumber: number): Promise<PdfLinkAnnotation[]> {
-    const doc = await this.getDocument(blobKey);
-    if (!doc) return [];
-    const page = await doc.getPage(pdfPageNumber);
-    const viewport = page.getViewport({ scale: 1 });
-    const annotations = await page.getAnnotations();
-    const links: PdfLinkAnnotation[] = [];
-
-    for (const ann of annotations) {
-      if (ann.subtype !== 'Link' || !ann.rect) continue;
-      const [rx1, ry1, rx2, ry2] = ann.rect as [number, number, number, number];
-      const [x1, y1] = viewport.convertToViewportPoint(rx1, ry1);
-      const [x2, y2] = viewport.convertToViewportPoint(rx2, ry2);
-      const left = Math.min(x1, x2);
-      const top = Math.min(y1, y2);
-      const width = Math.abs(x2 - x1);
-      const height = Math.abs(y2 - y1);
-
-      if (ann.url) {
-        links.push({ rectPt: [left, top, width, height], url: ann.url });
-      } else if (ann.dest) {
-        try {
-          const dest = typeof ann.dest === 'string' ? await doc.getDestination(ann.dest) : ann.dest;
-          if (Array.isArray(dest) && dest[0]) {
-            const pageIndex = await doc.getPageIndex(dest[0]);
-            links.push({ rectPt: [left, top, width, height], destPageNumber: pageIndex + 1 });
-          }
-        } catch {
-          // Skip unresolvable destinations
-        }
+    try {
+      const slot = this.pickSlot(blobKey);
+      let res = await this.callSlot<{ links?: PdfLinkAnnotation[]; needsBytes?: boolean }>(
+        slot,
+        'getPageLinks',
+        { blobKey, pageNumber: pdfPageNumber }
+      );
+      if (res.needsBytes) {
+        const bytes = await quireStorage.loadBlob(blobKey);
+        if (!bytes) return [];
+        const copy = new Uint8Array(bytes);
+        res = await this.callSlot<{ links?: PdfLinkAnnotation[] }>(
+          slot,
+          'getPageLinks',
+          { blobKey, bytes: copy, pageNumber: pdfPageNumber },
+          [copy.buffer]
+        );
+        slot.knownBlobs.add(blobKey);
       }
+      return res.links ?? [];
+    } catch {
+      return [];
     }
-    return links;
   }
 
   private evictTilesIfNeeded(): void {
@@ -208,23 +314,11 @@ class PdfEngine {
     }
   }
 
-  private evictDocsIfNeeded(): void {
-    while (this.docCache.size > this.maxCachedDocs) {
-      let oldestKey: string | null = null;
-      let oldestTime = Infinity;
-      for (const [k, v] of this.docCache.entries()) {
-        if (v.lastUsed < oldestTime) {
-          oldestTime = v.lastUsed;
-          oldestKey = k;
-        }
-      }
-      if (!oldestKey) break;
-      const entry = this.docCache.get(oldestKey);
-      if (entry) {
-        const docAny = entry.doc as unknown as { destroy?: () => Promise<void>; cleanup?: () => Promise<void> };
-        void (docAny.destroy ? docAny.destroy() : docAny.cleanup?.());
-      }
-      this.docCache.delete(oldestKey);
+  trimMemoryForBackground(): void {
+    this.clearAllTiles();
+    for (const slot of this.pool) {
+      slot.knownBlobs.clear();
+      void this.callSlot(slot, 'evictAll').catch(() => {});
     }
   }
 
