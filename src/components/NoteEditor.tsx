@@ -185,7 +185,7 @@ export function NoteEditor({
   // Lasso state
   const [lassoPageId, setLassoPageId] = useState<string | null>(null);
   const [lassoStrokeIds, setLassoStrokeIds] = useState<string[]>([]);
-  const [lassoPolygon, setLassoPolygon] = useState<Array<{ x: number; y: number }>>([]);
+  const lassoPolygonRef = useRef<Array<{ x: number; y: number }>>([]);
   const lassoBBoxRef = useRef<BBox | null>(null);
   const lassoDragRef = useRef<{
     active: boolean;
@@ -1219,7 +1219,7 @@ export function NoteEditor({
       }
       setLassoPageId(page.pageId);
       setLassoStrokeIds([]);
-      setLassoPolygon([{ x: xPt, y: yPt }]);
+      lassoPolygonRef.current = [{ x: xPt, y: yPt }];
       return;
     }
 
@@ -1332,7 +1332,7 @@ export function NoteEditor({
           offsetY,
           zoom,
           paperTheme,
-          polygon: lassoPolygon,
+          polygon: lassoPolygonRef.current,
           bbox: lassoBBoxRef.current,
           liftedStrokes: lifted,
           dx: lassoDragRef.current.dx,
@@ -1343,16 +1343,15 @@ export function NoteEditor({
         });
         return;
       }
-      if (lassoPolygon.length > 0 && lassoStrokeIds.length === 0 && e.buttons > 0) {
-        const nextPoly = [...lassoPolygon, pt];
-        setLassoPolygon(nextPoly);
+      if (lassoPolygonRef.current.length > 0 && lassoStrokeIds.length === 0 && e.buttons > 0) {
+        lassoPolygonRef.current.push(pt);
         sendToWetWorker({
           type: 'lasso-overlay',
           offsetX,
           offsetY,
           zoom,
           paperTheme,
-          polygon: nextPoly,
+          polygon: lassoPolygonRef.current,
           bbox: null,
           liftedStrokes: [],
           dx: 0,
@@ -1562,13 +1561,14 @@ export function NoteEditor({
         return;
       }
 
-      if (lassoPolygon.length >= 3 && lassoStrokeIds.length === 0) {
+      const poly = lassoPolygonRef.current;
+      if (poly.length >= 3 && lassoStrokeIds.length === 0) {
         const strokes = noteRef.current.strokesByPage[page.pageId] ?? [];
         let minX = Infinity;
         let minY = Infinity;
         let maxX = -Infinity;
         let maxY = -Infinity;
-        for (const p of lassoPolygon) {
+        for (const p of poly) {
           if (p.x < minX) minX = p.x;
           if (p.y < minY) minY = p.y;
           if (p.x > maxX) maxX = p.x;
@@ -1580,7 +1580,7 @@ export function NoteEditor({
           maxX,
           maxY,
         });
-        const matched = candidates.filter((s) => strokeInLasso(s, lassoPolygon));
+        const matched = candidates.filter((s) => strokeInLasso(s, poly));
         if (matched.length > 0) {
           const ids = matched.map((s) => s.id);
           const allPts = matched.flatMap((s) => s.points);
@@ -1607,13 +1607,13 @@ export function NoteEditor({
             anchorY: lassoDragRef.current.anchorY,
           });
         } else {
-          setLassoPolygon([]);
+          lassoPolygonRef.current = [];
           lassoBBoxRef.current = null;
           wetSeqRef.current += 1;
           sendToWetWorker({ type: 'clear' });
         }
-      } else if (lassoStrokeIds.length === 0 && lassoPolygon.length > 0) {
-        setLassoPolygon([]);
+      } else if (lassoStrokeIds.length === 0 && poly.length > 0) {
+        lassoPolygonRef.current = [];
         lassoBBoxRef.current = null;
         wetSeqRef.current += 1;
         sendToWetWorker({ type: 'clear' });
@@ -1727,7 +1727,7 @@ export function NoteEditor({
   const clearLasso = () => {
     if (
       lassoStrokeIds.length === 0 &&
-      lassoPolygon.length === 0 &&
+      lassoPolygonRef.current.length === 0 &&
       lassoPageId === null &&
       lassoBBoxRef.current === null
     ) {
@@ -1735,8 +1735,8 @@ export function NoteEditor({
     }
     lassoBBoxRef.current = null;
     lassoDragRef.current.active = false;
+    lassoPolygonRef.current = [];
     setLassoStrokeIds((prev) => (prev.length === 0 ? prev : []));
-    setLassoPolygon((prev) => (prev.length === 0 ? prev : []));
     setLassoPageId(null);
     wetSeqRef.current += 1;
     sendToWetWorker({ type: 'clear' });
