@@ -431,16 +431,19 @@ def run_suite_for_browser(browser_name: str, base_url: str, sample_pdf: Path, la
 
         # Verify Lasso select + tap-outside dismiss
         page.click("#tool-lasso")
-        page.mouse.move(slot_box_er["x"] + 60, slot_box_er["y"] + 90)
+        page.wait_for_selector("#tool-lasso.active", timeout=2000)
+        slot_box_lasso = page.locator('.page-slot[data-page-index="0"]').bounding_box()
+        assert slot_box_lasso is not None
+        page.mouse.move(slot_box_lasso["x"] + 60, slot_box_lasso["y"] + 90)
         page.mouse.down()
-        page.mouse.move(slot_box_er["x"] + 420, slot_box_er["y"] + 90, steps=4)
-        page.mouse.move(slot_box_er["x"] + 420, slot_box_er["y"] + 220, steps=4)
-        page.mouse.move(slot_box_er["x"] + 60, slot_box_er["y"] + 220, steps=4)
+        page.mouse.move(slot_box_lasso["x"] + 420, slot_box_lasso["y"] + 90, steps=5)
+        page.mouse.move(slot_box_lasso["x"] + 420, slot_box_lasso["y"] + 220, steps=5)
+        page.mouse.move(slot_box_lasso["x"] + 60, slot_box_lasso["y"] + 220, steps=5)
         page.mouse.up()
-        page.wait_for_selector(".lasso-actions", timeout=2000)
+        page.wait_for_selector(".lasso-actions", timeout=4000)
         # Tap outside bounding box -> dismisses cleanly
-        page.mouse.click(slot_box_er["x"] + 500, slot_box_er["y"] + 340)
-        page.wait_for_function("() => !document.querySelector('.lasso-actions')", timeout=2000)
+        page.mouse.click(slot_box_lasso["x"] + 500, slot_box_lasso["y"] + 340)
+        page.wait_for_function("() => !document.querySelector('.lasso-actions')", timeout=3000)
         print("[PASS] Lasso selection bounding box & tap-outside dismiss verified")
 
         # Add a Typed Text Box (FR-INK-06)

@@ -186,6 +186,7 @@ export function NoteEditor({
   const [lassoPageId, setLassoPageId] = useState<string | null>(null);
   const [lassoStrokeIds, setLassoStrokeIds] = useState<string[]>([]);
   const lassoPolygonRef = useRef<Array<{ x: number; y: number }>>([]);
+  const lassoDrawingRef = useRef(false);
   const lassoBBoxRef = useRef<BBox | null>(null);
   const lassoDragRef = useRef<{
     active: boolean;
@@ -1220,6 +1221,7 @@ export function NoteEditor({
       setLassoPageId(page.pageId);
       setLassoStrokeIds([]);
       lassoPolygonRef.current = [{ x: xPt, y: yPt }];
+      lassoDrawingRef.current = true;
       return;
     }
 
@@ -1343,7 +1345,7 @@ export function NoteEditor({
         });
         return;
       }
-      if (lassoPolygonRef.current.length > 0 && lassoStrokeIds.length === 0 && e.buttons > 0) {
+      if (lassoDrawingRef.current && lassoPolygonRef.current.length > 0 && lassoStrokeIds.length === 0) {
         lassoPolygonRef.current.push(pt);
         sendToWetWorker({
           type: 'lasso-overlay',
@@ -1561,6 +1563,7 @@ export function NoteEditor({
         return;
       }
 
+      lassoDrawingRef.current = false;
       const poly = lassoPolygonRef.current;
       if (poly.length >= 3 && lassoStrokeIds.length === 0) {
         const strokes = noteRef.current.strokesByPage[page.pageId] ?? [];

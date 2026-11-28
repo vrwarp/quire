@@ -225,7 +225,7 @@ export function LibrarySidebar({
             id="btn-open-settings"
             type="button"
             class="btn-icon"
-            title="Settings, Sync & Auto-Backup"
+            title="Settings, Local Storage & Backup"
             aria-label="Open Settings"
             onClick={onOpenSettings}
           >
