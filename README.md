@@ -1,30 +1,34 @@
-# Quire — 120 Hz Local-First Web Notes & PDF Annotation
+# Quire v1.0 — 120 Hz Local-First Web Notes & PDF Annotation
 
-**Quire** is a fast, local-first handwritten note-taking, multi-page PDF annotation, and stroke-synced audio review web application / standalone PWA designed for **iPadOS 18.4+ ProMotion (120 Hz)**, macOS, Windows, and Android tablets.
+**Quire** is a fast, zero-backend, zero-telemetry, 100% local-first handwritten note-taking, multi-page PDF annotation, and stroke-synced audio review PWA built for **iPadOS 18.4+ ProMotion (120 Hz)**, macOS, Windows, and Android tablets.
 
-## Key Architectural Highlights
+## Production Architecture Highlights
 
-- **120 Hz iOS/iPadOS Safari & PWA Rendering (`OffscreenCanvas` + ProMotion Governor)**:
-  - Transfers the wet-ink `<canvas>` to a dedicated worker (`src/workers/ink.worker.ts`) via `transferControlToOffscreen()`, drawing directly on incoming `MessagePort` frames (never waiting on WebKit’s 60 Hz worker `requestAnimationFrame`) so WebKit commits zero-copy `IOSurface` frames out-of-band via `AsyncSetLayerContents`.
-  - Pairs an on-demand **ProMotion Governor** (`src/engine/promotion.ts`) — `.quire-rate-mark`, `.quire-display-pacer`, empty `rAF` scroll-IPC flusher, and `.quire-scroll-keep` — with a **120 Hz vsync-phase-locked scroll bus** (`src/engine/scrollBus.ts`).
+- **120 Hz Dedicated `InkRenderWorker` (`src/workers/ink.worker.ts`) & ProMotion Governor (`src/engine/promotion.ts`)**:
+  - Transfers the wet-ink `<canvas>` via `transferControlToOffscreen()` to a single-surface desynchronized 2D `OffscreenCanvas` worker with `O(1)` delta point streaming and tight dirty-rect clearing (zero WebKit GPU readback stalls or pen-lift blinks).
+  - Pairs an on-demand ProMotion Governor with `O(log P)` virtualized scroll-offset binary search (`src/engine/spatialIndex.ts`) and per-page 2D spatial indexing for `<0.15 ms` eraser, lasso, and audio tap-to-jump queries on 5,000+ stroke pages.
 - **240 Hz Apple Pencil Capture & Vector Ink (`src/engine/inkMath.ts`, `src/engine/inputRouter.ts`)**:
-  - Unpacks `getCoalescedEvents()` and `getPredictedEvents()` with `pressure`, `altitudeAngle`, and `azimuthAngle`, smoothed by a 1€ filter and extruded into pressure-sensitive vector ribbons.
-  - Includes **Single-Layer Non-Darkening Highlighter** (`mix-blend-mode: multiply` behind pen ink), **Whole-Stroke & Analytical Partial Vector Eraser**, **400 ms Hold-to-Snap Geometric Shapes**, **120 FPS Lifted Lasso**, **Quick-Hold Thumb Pill**, **Scribble-Scratch Erase**, **2/3-finger Undo/Redo**, and **Typed Text Boxes**.
-- **Virtualized Multi-Page PDF Engine (`src/engine/pdfEngine.ts`)**:
-  - Lazy page rendering with a bounded `ImageBitmap` LRU cache (`bitmap.close()` on eviction), password-protected PDF support, internal PDF hyperlinks in Pan/Read mode, and `O(1)` mixed-page management (insert/reorder/duplicate/delete + per-page templates).
-- **Crash-Safe Audio Sync (`src/engine/audio.ts`)**:
-  - Hardware AAC `MediaRecorder` flushing chunks to OPFS every 10 seconds, Screen Wake Lock + OLED Dim Curtain, tap-stroke-to-jump playback with configurable pre-roll, variable speed (`0.5x–2.0x`), `±15s` skip, and 120 FPS progressive stroke replay.
-- **Local-First OPFS/IndexedDB Storage, Delta Sync & True Vector Export (`src/engine/storage.ts`, `src/engine/syncEngine.ts`, `src/engine/exportEngine.ts`)**:
-  - 5-level nested folders, tags, Favorites, Recents, 30-day Recently Deleted, `<10 ms` local search, non-destructive HLC Conflict Copies, true cubic-Bézier Vector PDF export, 2x PNG export, and lossless `.quire` archive export/import.
+  - Unpacks `getCoalescedEvents()` and `getPredictedEvents()` with `pressure`, `altitudeAngle`, and `azimuthAngle`, Barry–Goldman Centripetal Catmull-Rom interpolation, single-layer non-darkening Highlighter, whole-stroke & analytical partial Vector Eraser, 400 ms Hold-to-Snap shapes, 120 FPS Lifted Lasso, Quick-Hold Thumb Pill, 2/3-finger Undo/Redo, and Typed Text Boxes.
+- **Dedicated `StorageSyncWorker` (`src/workers/storage.worker.ts`, `src/engine/storage.ts`, `src/engine/qbin.ts`)**:
+  - SQLite 3.54 WASM (`opfs-sahpool` VFS + FTS5 full-text search) + OPFS `FileSystemSyncAccessHandle` `.qbin` binary page snapshots and checksummed `.wal` stroke logs, reference-counted blob GC, automatic `quire-local-v1` IndexedDB migration, `BroadcastChannel` single-active-window lock handoff (`src/engine/windowLock.ts`), and Private Browsing IndexedDB fallback.
+- **2-Worker `PDFium-WASM` Pool (`src/workers/pdf.worker.ts`, `src/engine/pdfEngine.ts`)**:
+  - Off-main-thread PDFium-WASM rendering with bounded `ImageBitmap` LRU (`<350 MB` RAM ceiling + `visibilitychange` trim), crisp high-zoom (`>2x`) viewport sub-tiles, internal/external link extraction, and local password-PDF unlocking.
+- **Off-Main-Thread `ExportWorker` (`src/workers/export.worker.ts`, `src/engine/pdfVectorBuilder.ts`, `src/engine/exportEngine.ts`)**:
+  - True cubic-Bézier Vector PDF export with `@pdf-lib/fontkit` Unicode font subsetting + automatic 3x CJK/emoji raster fallback, PDF Knockout Transparency Groups (`/K true`) for non-darkening highlighters, 2x Retina PNG export, lossless single-note & Full-Library `.quire` streaming backup/restore with HLC conflict-safe merging, native Share Sheet (`navigator.share`), and optional Chromium local-folder auto-backup.
+- **Crash-Safe App-Level Audio Sync (`src/engine/audio.ts`)**:
+  - `O(1)` 10-second OPFS `SyncAccessHandle` chunk appends with SQLite duration/segment checkpointing, `visibilitychange` auto-segmentation, Screen Wake Lock (+ iPadOS `<18.4` video fallback) + OLED Dim Curtain, `preservesPitch`, session rename/delete/export, and an App-level floating recording bar that survives navigating across notes.
+- **Air-Gapped Offline PWA (`src/sw.ts`, `src/engine/pwa.ts`, `index.html`)**:
+  - Workbox two-tier caching (Tier-1 eager App Shell + Ink + SQLite WASM; Tier-2 `requestIdleCallback` warm-up for PDFium-WASM & Unicode export font), safe "Update Ready" prompts, `window.launchQueue` (`file_handlers`) & `POST ?share-target=1` interception, strict `<meta>` CSP (`connect-src 'self' blob: data:`), `ErrorBoundary` with emergency `.quire` export, and local-only Diagnostics log export.
 
 ## Getting Started
 
 ```bash
 npm install
-npm run dev        # Start Vite dev server
-npm test           # Run Vitest unit test suite
-npm run build      # TypeScript check + production bundle
-python3 tests/e2e_validate.py  # Run Playwright E2E suite (CUJ 1–7)
+npm run dev                        # Start Vite dev server
+npm run lint                       # Run oxlint across src/ and tests/
+npm test                           # Run Vitest unit test suite
+VITE_BASE_PATH=/quire/ npm run build  # TypeScript check + GitHub Pages production bundle
+E2E_BROWSER=all python3 tests/e2e_validate.py  # Run Playwright Chromium + WebKit E2E suite
 ```
 
-See [docs/TDD.md](docs/TDD.md) for the complete technical design document.
+See [docs/TDD.md](docs/TDD.md) for the complete V1.0 technical design document.

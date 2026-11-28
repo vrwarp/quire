@@ -15,7 +15,7 @@ import {
   Sun,
   Trash2,
 } from 'lucide-preact';
-import type { Folder, NoteDocument, ThemeMode } from '../types';
+import type { Folder, NoteSummary, ThemeMode } from '../types';
 import { getFolderDepth } from '../engine/storage';
 
 export type LibraryFilter =
@@ -28,7 +28,7 @@ export type LibraryFilter =
 
 interface LibrarySidebarProps {
   collapsed: boolean;
-  notes: NoteDocument[];
+  notes: NoteSummary[];
   folders: Folder[];
   filter: LibraryFilter;
   searchQuery: string;
@@ -39,6 +39,7 @@ interface LibrarySidebarProps {
   onNewNote: () => void;
   onTriggerPdfImport: () => void;
   onCreateFolder: (name: string, parentId: string | null, color: string) => void;
+  onRenameFolder: (folderId: string, newName: string) => void;
   onDeleteFolder: (folderId: string) => void;
   onMoveNoteToFolder: (noteId: string, folderId: string | null) => void;
   onOpenSettings: () => void;
@@ -59,6 +60,7 @@ export function LibrarySidebar({
   onNewNote,
   onTriggerPdfImport,
   onCreateFolder,
+  onRenameFolder,
   onDeleteFolder,
   onMoveNoteToFolder,
   onOpenSettings,
@@ -67,6 +69,8 @@ export function LibrarySidebar({
   const [folderName, setFolderName] = useState('');
   const [folderParentId, setFolderParentId] = useState<string | null>(null);
   const [folderColor, setFolderColor] = useState(FOLDER_COLORS[0]);
+  const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
 
   const activeNotes = notes.filter((n) => !n.deletedAt);
   const trashNotes = notes.filter((n) => !!n.deletedAt);
@@ -89,12 +93,21 @@ export function LibrarySidebar({
     return children.map((folder) => {
       const count = activeNotes.filter((n) => n.folderId === folder.id).length;
       const isActive = filter.kind === 'folder' && filter.folderId === folder.id;
+      const isRenaming = renamingFolderId === folder.id;
       return (
         <div key={folder.id}>
           <div
             class={`nav-item ${isActive ? 'active' : ''}`}
             style={{ paddingLeft: `${10 + depth * 14}px` }}
-            onClick={() => onSelectFilter({ kind: 'folder', folderId: folder.id })}
+            onClick={() => {
+              if (!isRenaming) onSelectFilter({ kind: 'folder', folderId: folder.id });
+            }}
+            onKeyDown={(e) => {
+              if ((e.key === 'Enter' || e.key === ' ') && !isRenaming) {
+                e.preventDefault();
+                onSelectFilter({ kind: 'folder', folderId: folder.id });
+              }
+            }}
             onDragOver={(e) => e.preventDefault()}
             onDrop={(e) => {
               e.preventDefault();
@@ -106,14 +119,68 @@ export function LibrarySidebar({
           >
             <span class="folder-dot" style={{ background: folder.color }} />
             <FolderIcon size={15} />
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {folder.name}
-            </span>
+            {isRenaming ? (
+              <form
+                style={{ flex: 1, minWidth: 0 }}
+                onClick={(e) => e.stopPropagation()}
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const clean = renameDraft.trim();
+                  if (clean) onRenameFolder(folder.id, clean);
+                  setRenamingFolderId(null);
+                }}
+              >
+                <input
+                  type="text"
+                  autoFocus
+                  value={renameDraft}
+                  onInput={(e) => setRenameDraft((e.target as HTMLInputElement).value)}
+                  onBlur={() => {
+                    const clean = renameDraft.trim();
+                    if (clean) onRenameFolder(folder.id, clean);
+                    setRenamingFolderId(null);
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '2px 5px',
+                    borderRadius: '4px',
+                    border: '1px solid var(--border-strong)',
+                    background: 'var(--surface-1)',
+                    fontSize: '12.5px',
+                  }}
+                />
+              </form>
+            ) : (
+              <span
+                style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                onDblClick={(e) => {
+                  e.stopPropagation();
+                  setRenamingFolderId(folder.id);
+                  setRenameDraft(folder.name);
+                }}
+              >
+                {folder.name}
+              </span>
+            )}
             <span class="nav-count">{count}</span>
             <button
               type="button"
               class="btn-icon"
-              style={{ width: '22px', height: '22px' }}
+              style={{ width: '20px', height: '20px', fontSize: '11px' }}
+              title="Rename folder"
+              aria-label={`Rename folder ${folder.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setRenamingFolderId(folder.id);
+                setRenameDraft(folder.name);
+              }}
+            >
+              ✎
+            </button>
+            <button
+              type="button"
+              class="btn-icon"
+              style={{ width: '20px', height: '20px' }}
               title="Delete folder"
               aria-label={`Delete folder ${folder.name}`}
               onClick={(e) => {

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   FileText,
+  FolderInput,
   Grid,
   List,
   Menu,
   Mic,
   RotateCcw,
+  Square,
   Star,
   Trash2,
 } from 'lucide-preact';
@@ -13,22 +15,26 @@ import type {
   AppSettings,
   Folder,
   NoteDocument,
+  NoteSummary,
   PageDescriptor,
   PaperTemplate,
   PaperTheme,
+  StorageHealth,
 } from './types';
 import {
   DEFAULT_SETTINGS,
   createBlankPage,
   createId,
   createNewNote,
+  getDescendantFolderIds,
+  noteToSummary,
   quireStorage,
   searchNotes,
 } from './engine/storage';
 import { generateOrderKey } from './engine/inkMath';
 import { pdfEngine } from './engine/pdfEngine';
 import { getPaperTemplateSvgDataUri } from './engine/paperTemplate';
-import { mergeNoteVersions, tickHLC } from './engine/syncEngine';
+import { tickHLC } from './engine/syncEngine';
 import {
   applyDocumentTheme,
   getSystemPrefersDark,
@@ -36,27 +42,48 @@ import {
   resolveEffectivePaperTheme,
   resolveThemeMode,
 } from './engine/theme';
+import { AudioSyncRecorder, formatDuration, type RecordingState } from './engine/audio';
+import { WindowLockCoordinator } from './engine/windowLock';
+import { getCachedThumbUrl, loadThumbUrl } from './engine/thumbnails';
+import {
+  attachOsFileHandlers,
+  registerQuireServiceWorker,
+  type PwaUpdateController,
+} from './engine/pwa';
+import { logDiagnostic } from './engine/diagnostics';
 import { LibrarySidebar, type LibraryFilter } from './components/LibrarySidebar';
 import { NoteEditor } from './components/NoteEditor';
 import {
+  ConfirmModal,
   ExportModal,
   PageManagerModal,
+  PasswordModal,
   SettingsModal,
   WelcomeSheet,
 } from './components/Modals';
 
 type SortKey = 'updatedAt' | 'createdAt' | 'title';
 
+function parseNoteIdFromHash(): string | null {
+  if (typeof window === 'undefined') return null;
+  const match = window.location.hash.match(/^#\/note\/([a-zA-Z0-9_-]+)$/);
+  return match ? match[1] : null;
+}
+
 export function App() {
   const [hydrated, setHydrated] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
-  const [notes, setNotes] = useState<NoteDocument[]>([]);
+  const [storageHealth, setStorageHealth] = useState<StorageHealth | null>(null);
+  const [noteSummaries, setNoteSummaries] = useState<NoteSummary[]>([]);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
+  const [activeNote, setActiveNote] = useState<NoteDocument | null>(null);
+  const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filter, setFilter] = useState<LibraryFilter>({ kind: 'all' });
   const [searchQuery, setSearchQuery] = useState('');
+  const [ftsMatchedIds, setFtsMatchedIds] = useState<Set<string> | null>(null);
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [sortKey, setSortKey] = useState<SortKey>('updatedAt');
 
@@ -65,9 +92,46 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [jumpToPageRequest, setJumpToPageRequest] = useState<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [moveMenuNoteId, setMoveMenuNoteId] = useState<string | null>(null);
+
+  // Single-active-window OPFS lock overlay
+  const [pausedByOtherTab, setPausedByOtherTab] = useState(false);
+  const lockCoordinatorRef = useRef<WindowLockCoordinator | null>(null);
+
+  // PWA safe update prompt
+  const [pwaUpdate, setPwaUpdate] = useState<PwaUpdateController | null>(null);
+
+  // Accessible Password & Confirm modals
+  const [passwordPrompt, setPasswordPrompt] = useState<{
+    file: File;
+    bytes: Uint8Array;
+    errorMessage: string | null;
+  } | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    onConfirm: () => void;
+  } | null>(null);
+
+  // App-level persistent audio recorder (never drops mic when navigating to Library / other notes)
+  const audioRecorderRef = useRef<AudioSyncRecorder | null>(null);
+  const [recordingState, setRecordingState] = useState<RecordingState>('idle');
+  const [recordingNoteId, setRecordingNoteId] = useState<string | null>(null);
+  const [recordingSessionId, setRecordingSessionId] = useState<string | null>(null);
+  const [recordingElapsedMs, setRecordingElapsedMs] = useState(0);
+
+  // Optional Chromium local backup folder handle (in-memory for current session)
+  const localBackupDirRef = useRef<FileSystemDirectoryHandle | null>(null);
 
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const toastTimerRef = useRef<number>(0);
+  const activeNoteRef = useRef<NoteDocument | null>(null);
+  activeNoteRef.current = activeNote;
+  const settingsRef = useRef<AppSettings>(settings);
+  settingsRef.current = settings;
+  const noteSummariesRef = useRef<NoteSummary[]>(noteSummaries);
+  noteSummariesRef.current = noteSummaries;
 
   const showToast = useCallback((msg: string, durationMs = 3200) => {
     setToast(msg);
@@ -75,20 +139,208 @@ export function App() {
     toastTimerRef.current = window.setTimeout(() => setToast(null), durationMs);
   }, []);
 
-  // Hydrate local-first storage immediately on cold launch
-  useEffect(() => {
-    void (async () => {
-      const [loadedSettings, loadedNotes, loadedFolders] = await Promise.all([
-        quireStorage.loadSettings(),
-        quireStorage.loadAllNotes(),
-        quireStorage.loadAllFolders(),
-      ]);
-      setSettings(loadedSettings);
-      setNotes(loadedNotes);
-      setFolders(loadedFolders);
-      setHydrated(true);
-    })();
+  const refreshStorageHealth = useCallback(async () => {
+    try {
+      const h = await quireStorage.getStorageHealth();
+      setStorageHealth(h);
+    } catch {
+      // ignore
+    }
   }, []);
+
+  const pendingSavesRef = useRef<
+    Map<string, { note: NoteDocument; dirtyPageIds?: Set<string>; timer: number }>
+  >(new Map());
+
+  const flushPendingSaves = useCallback(() => {
+    for (const [id, entry] of pendingSavesRef.current.entries()) {
+      window.clearTimeout(entry.timer);
+      pendingSavesRef.current.delete(id);
+      const dirty = entry.dirtyPageIds ? [...entry.dirtyPageIds] : undefined;
+      void quireStorage.saveNote(entry.note, dirty);
+    }
+  }, []);
+
+  const cancelPendingSave = useCallback((noteId: string) => {
+    const existing = pendingSavesRef.current.get(noteId);
+    if (existing) {
+      window.clearTimeout(existing.timer);
+      pendingSavesRef.current.delete(noteId);
+    }
+  }, []);
+
+  const openNoteById = useCallback(
+    async (noteId: string | null, pushHistory = true) => {
+      flushPendingSaves();
+      if (!noteId) {
+        setActiveNoteId(null);
+        setActiveNote(null);
+        setSidebarCollapsed(false);
+        if (pushHistory && typeof window !== 'undefined' && window.location.hash.startsWith('#/note/')) {
+          window.history.pushState(null, '', window.location.pathname + window.location.search);
+        }
+        if (settingsRef.current.lastOpenedNoteId !== null) {
+          const nextSettings = { ...settingsRef.current, lastOpenedNoteId: null };
+          setSettings(nextSettings);
+          void quireStorage.saveSettings(nextSettings);
+        }
+        return;
+      }
+
+      const loaded = await quireStorage.loadNote(noteId);
+      if (!loaded || loaded.deletedAt) {
+        setActiveNoteId(null);
+        setActiveNote(null);
+        return;
+      }
+      setActiveNoteId(loaded.id);
+      setActiveNote(loaded);
+      setSidebarCollapsed(true);
+      if (pushHistory && typeof window !== 'undefined') {
+        const nextHash = `#/note/${loaded.id}`;
+        if (window.location.hash !== nextHash) {
+          window.history.pushState({ noteId: loaded.id }, '', nextHash);
+        }
+      }
+      if (settingsRef.current.lastOpenedNoteId !== loaded.id) {
+        const nextSettings = { ...settingsRef.current, lastOpenedNoteId: loaded.id };
+        setSettings(nextSettings);
+        void quireStorage.saveSettings(nextSettings);
+      }
+    },
+    [flushPendingSaves]
+  );
+
+  // Hydrate SQLite/OPFS StorageSyncWorker + WindowLockCoordinator on cold launch
+  useEffect(() => {
+    let mounted = true;
+    const coordinator = new WindowLockCoordinator({
+      onYieldLock: async () => {
+        if (mounted) setPausedByOtherTab(true);
+        flushPendingSaves();
+        await quireStorage.pauseForLockHandoff();
+      },
+      onResumeLock: async () => {
+        await quireStorage.resumeAfterLockHandoff();
+        const [loadedSettings, loadedSummaries, loadedFolders] = await Promise.all([
+          quireStorage.loadSettings(),
+          quireStorage.loadNoteSummaries(),
+          quireStorage.loadAllFolders(),
+        ]);
+        if (!mounted) return;
+        setSettings(loadedSettings);
+        setNoteSummaries(loadedSummaries);
+        setFolders(loadedFolders);
+        if (activeNoteRef.current) {
+          const refreshed = await quireStorage.loadNote(activeNoteRef.current.id);
+          if (mounted) setActiveNote(refreshed);
+        }
+        setPausedByOtherTab(false);
+      },
+    });
+    lockCoordinatorRef.current = coordinator;
+
+    void (async () => {
+      await coordinator.claimOwnership();
+      await quireStorage.init();
+      const [loadedSettings, loadedSummaries, loadedFolders, health] = await Promise.all([
+        quireStorage.loadSettings(),
+        quireStorage.loadNoteSummaries(),
+        quireStorage.loadAllFolders(),
+        quireStorage.getStorageHealth(),
+      ]);
+      if (!mounted) return;
+      setSettings(loadedSettings);
+      setNoteSummaries(loadedSummaries);
+      setFolders(loadedFolders);
+      setStorageHealth(health);
+      setHydrated(true);
+
+      // Restore note from URL hash or lastOpenedNoteId
+      const hashNoteId = parseNoteIdFromHash();
+      const targetId = hashNoteId ?? (loadedSettings.hasCompletedOnboarding ? loadedSettings.lastOpenedNoteId : null);
+      if (targetId && loadedSummaries.some((n) => n.id === targetId && !n.deletedAt)) {
+        const doc = await quireStorage.loadNote(targetId);
+        if (mounted && doc && !doc.deletedAt) {
+          setActiveNoteId(doc.id);
+          setActiveNote(doc);
+          setSidebarCollapsed(true);
+        }
+      }
+    })();
+
+    return () => {
+      mounted = false;
+      coordinator.dispose();
+    };
+  }, [flushPendingSaves]);
+
+  // History popstate listener (supports iPadOS swipe-back & browser Back/Forward)
+  useEffect(() => {
+    const onPopState = () => {
+      const id = parseNoteIdFromHash();
+      void openNoteById(id, false);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [openNoteById]);
+
+  // Register Workbox Service Worker with safe update prompt
+  useEffect(() => {
+    registerQuireServiceWorker((controller) => {
+      setPwaUpdate(controller);
+    });
+  }, []);
+
+  // Load cached thumbnails for visible library notes
+  useEffect(() => {
+    if (!hydrated || activeNoteId) return;
+    let active = true;
+    void (async () => {
+      const next: Record<string, string> = {};
+      for (const n of noteSummaries.slice(0, 48)) {
+        const firstPageId = n.pages[0]?.pageId;
+        if (!firstPageId) continue;
+        const url = getCachedThumbUrl(firstPageId) ?? (await loadThumbUrl(firstPageId));
+        if (url) next[firstPageId] = url;
+      }
+      if (active && Object.keys(next).length > 0) {
+        setThumbUrls((prev) => ({ ...prev, ...next }));
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [hydrated, activeNoteId, noteSummaries]);
+
+  // SQLite FTS5 async search across titles, folders, tags, and typed text boxes (<5ms)
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) {
+      setFtsMatchedIds(null);
+      return;
+    }
+    let cancelled = false;
+    void quireStorage.searchNoteIds(q).then((ids) => {
+      if (!cancelled) {
+        setFtsMatchedIds(ids ? new Set(ids) : null);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [searchQuery]);
+
+  // App-level recording elapsed timer
+  useEffect(() => {
+    if (recordingState !== 'recording') return;
+    const id = window.setInterval(() => {
+      if (audioRecorderRef.current) {
+        setRecordingElapsedMs(audioRecorderRef.current.getElapsedMs());
+      }
+    }, 200);
+    return () => window.clearInterval(id);
+  }, [recordingState]);
 
   const [systemPrefersDark, setSystemPrefersDark] = useState<boolean>(getSystemPrefersDark);
 
@@ -103,7 +355,6 @@ export function App() {
 
   const resolvedTheme = resolveThemeMode(settings.themeMode, systemPrefersDark);
 
-  // Sync resolved theme + meta theme-color + localStorage bootstrap key synchronously before paint
   useLayoutEffect(() => {
     if (!hydrated) return;
     applyDocumentTheme(resolvedTheme, settings.themeMode);
@@ -112,24 +363,6 @@ export function App() {
   const updateSettings = useCallback((next: AppSettings) => {
     setSettings(next);
     void quireStorage.saveSettings(next);
-  }, []);
-
-  const pendingSavesRef = useRef<Map<string, { note: NoteDocument; timer: number }>>(new Map());
-
-  const flushPendingSaves = useCallback(() => {
-    for (const [id, entry] of pendingSavesRef.current.entries()) {
-      window.clearTimeout(entry.timer);
-      pendingSavesRef.current.delete(id);
-      void quireStorage.saveNote(entry.note);
-    }
-  }, []);
-
-  const cancelPendingSave = useCallback((noteId: string) => {
-    const existing = pendingSavesRef.current.get(noteId);
-    if (existing) {
-      window.clearTimeout(existing.timer);
-      pendingSavesRef.current.delete(noteId);
-    }
   }, []);
 
   useEffect(() => {
@@ -147,87 +380,217 @@ export function App() {
     };
   }, [flushPendingSaves]);
 
-  const persistNote = useCallback((updated: NoteDocument, immediate = false) => {
-    const withHlc: NoteDocument = {
-      ...updated,
-      hlc: tickHLC(updated.hlc),
-    };
-    setNotes((prev) => {
-      const exists = prev.some((n) => n.id === withHlc.id);
-      return exists ? prev.map((n) => (n.id === withHlc.id ? withHlc : n)) : [withHlc, ...prev];
-    });
-    const prevEntry = pendingSavesRef.current.get(withHlc.id);
-    if (prevEntry) {
-      window.clearTimeout(prevEntry.timer);
-      pendingSavesRef.current.delete(withHlc.id);
-    }
-    if (immediate) {
-      void quireStorage.saveNote(withHlc);
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      pendingSavesRef.current.delete(withHlc.id);
-      void quireStorage.saveNote(withHlc);
-    }, 180);
-    pendingSavesRef.current.set(withHlc.id, { note: withHlc, timer });
-  }, []);
+  const persistNote = useCallback(
+    (updated: NoteDocument, dirtyPageIds?: string[], immediate = false) => {
+      const withHlc: NoteDocument = {
+        ...updated,
+        hlc: tickHLC(updated.hlc),
+      };
+      const summary = noteToSummary(withHlc);
+      setNoteSummaries((prev) => {
+        const exists = prev.some((n) => n.id === summary.id);
+        return exists ? prev.map((n) => (n.id === summary.id ? summary : n)) : [summary, ...prev];
+      });
+      if (activeNoteRef.current?.id === withHlc.id) {
+        setActiveNote(withHlc);
+      }
 
-  const activeNotes = useMemo(() => notes.filter((n) => !n.deletedAt), [notes]);
-  const activeNote = useMemo(
-    () => notes.find((n) => n.id === activeNoteId) ?? null,
-    [notes, activeNoteId]
+      const prevEntry = pendingSavesRef.current.get(withHlc.id);
+      const mergedDirty = prevEntry?.dirtyPageIds ? new Set(prevEntry.dirtyPageIds) : new Set<string>();
+      if (dirtyPageIds && dirtyPageIds.length > 0) {
+        dirtyPageIds.forEach((pid) => mergedDirty.add(pid));
+      } else {
+        mergedDirty.clear();
+      }
+      if (prevEntry) {
+        window.clearTimeout(prevEntry.timer);
+        pendingSavesRef.current.delete(withHlc.id);
+      }
+
+      if (immediate) {
+        void quireStorage.saveNote(withHlc, mergedDirty.size > 0 ? [...mergedDirty] : undefined);
+        return;
+      }
+
+      const timer = window.setTimeout(() => {
+        pendingSavesRef.current.delete(withHlc.id);
+        void quireStorage.saveNote(withHlc, mergedDirty.size > 0 ? [...mergedDirty] : undefined);
+      }, 180);
+      pendingSavesRef.current.set(withHlc.id, {
+        note: withHlc,
+        dirtyPageIds: mergedDirty.size > 0 ? mergedDirty : undefined,
+        timer,
+      });
+    },
+    []
   );
 
-  // CUJ 1: First-time welcome -> immediately create & open writable note (<1.5s)
+  const persistSummaryOnly = useCallback((summary: NoteSummary) => {
+    const withHlc: NoteSummary = { ...summary, hlc: tickHLC(summary.hlc) };
+    setNoteSummaries((prev) => prev.map((n) => (n.id === withHlc.id ? withHlc : n)));
+    if (activeNoteRef.current?.id === withHlc.id) {
+      setActiveNote((prev) => (prev ? { ...prev, ...withHlc } : prev));
+    }
+    void quireStorage.saveNoteMetadata(withHlc);
+  }, []);
+
+  // App-level Audio Recording handlers (survive navigation across Library & other notes)
+  const handleToggleRecording = useCallback(
+    async (noteId: string): Promise<string | null> => {
+      if (recordingState === 'idle') {
+        const target =
+          activeNoteRef.current?.id === noteId
+            ? activeNoteRef.current
+            : await quireStorage.loadNote(noteId);
+        if (!target) return null;
+        try {
+          const rec = new AudioSyncRecorder({
+            onInterruption: (reason) => {
+              setRecordingState('paused');
+              showToast(reason);
+            },
+            onCheckpoint: (durationMs, segments) => {
+              setNoteSummaries((prev) =>
+                prev.map((n) =>
+                  n.id === noteId
+                    ? {
+                        ...n,
+                        audioSessions: n.audioSessions.map((s) =>
+                          s.id === rec.activeSessionId ? { ...s, durationMs, segments } : s
+                        ),
+                      }
+                    : n
+                )
+              );
+              if (activeNoteRef.current?.id === noteId) {
+                setActiveNote((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        audioSessions: prev.audioSessions.map((s) =>
+                          s.id === rec.activeSessionId ? { ...s, durationMs, segments } : s
+                        ),
+                      }
+                    : prev
+                );
+              }
+            },
+          });
+          const session = await rec.start(target.audioSessions.length, noteId);
+          audioRecorderRef.current = rec;
+          setRecordingState('recording');
+          setRecordingNoteId(noteId);
+          setRecordingSessionId(session.id);
+          setRecordingElapsedMs(0);
+          persistNote(
+            {
+              ...target,
+              updatedAt: Date.now(),
+              audioSessions: [...target.audioSessions, session],
+            },
+            undefined,
+            true
+          );
+          return session.id;
+        } catch (err) {
+          showToast(`Microphone unavailable: ${(err as Error).message}`);
+          return null;
+        }
+      } else if (recordingState === 'recording') {
+        audioRecorderRef.current?.pause();
+        setRecordingState('paused');
+        return null;
+      } else {
+        audioRecorderRef.current?.resume();
+        setRecordingState('recording');
+        return null;
+      }
+    },
+    [recordingState, persistNote, showToast]
+  );
+
+  const handleStopRecording = useCallback(async () => {
+    const rec = audioRecorderRef.current;
+    if (!rec) return;
+    const sid = rec.activeSessionId;
+    const nid = rec.activeNoteId;
+    const { durationMs, segments } = await rec.stop();
+    audioRecorderRef.current = null;
+    setRecordingState('idle');
+    setRecordingNoteId(null);
+    setRecordingSessionId(null);
+    setRecordingElapsedMs(0);
+
+    if (sid && nid) {
+      const target =
+        activeNoteRef.current?.id === nid
+          ? activeNoteRef.current
+          : await quireStorage.loadNote(nid);
+      if (target) {
+        persistNote(
+          {
+            ...target,
+            updatedAt: Date.now(),
+            audioSessions: target.audioSessions.map((s) =>
+              s.id === sid ? { ...s, durationMs, segments } : s
+            ),
+          },
+          undefined,
+          true
+        );
+      }
+    }
+    showToast(`Saved audio recording (${formatDuration(durationMs)})`);
+  }, [persistNote, showToast]);
+
+  const activeNotes = useMemo(() => noteSummaries.filter((n) => !n.deletedAt), [noteSummaries]);
+
   const handleCompleteOnboarding = (prefs: {
     template: PaperTemplate;
     theme: PaperTheme;
     scrollDirection: AppSettings['defaultScrollDirection'];
   }) => {
+    const firstNote = createNewNote(
+      {
+        ...settings,
+        defaultTemplate: prefs.template,
+        defaultPaperTheme: prefs.theme,
+        defaultScrollDirection: prefs.scrollDirection,
+      },
+      null
+    );
     const nextSettings: AppSettings = {
       ...settings,
       hasCompletedOnboarding: true,
       defaultTemplate: prefs.template,
       defaultPaperTheme: prefs.theme,
       defaultScrollDirection: prefs.scrollDirection,
+      lastOpenedNoteId: firstNote.id,
     };
     updateSettings(nextSettings);
-    const firstNote = createNewNote(nextSettings, null);
-    persistNote(firstNote, true);
+    persistNote(firstNote, undefined, true);
     setActiveNoteId(firstNote.id);
+    setActiveNote(firstNote);
     setSidebarCollapsed(true);
+    window.history.replaceState({ noteId: firstNote.id }, '', `#/note/${firstNote.id}`);
   };
 
-  // CUJ 1: One-tap + New Note (unlimited local-first notes)
   const handleCreateNote = () => {
     const targetFolder = filter.kind === 'folder' ? filter.folderId : null;
     const fresh = createNewNote(settings, targetFolder);
-    persistNote(fresh, true);
+    persistNote(fresh, undefined, true);
     setActiveNoteId(fresh.id);
+    setActiveNote(fresh);
     setSidebarCollapsed(true);
+    window.history.pushState({ noteId: fresh.id }, '', `#/note/${fresh.id}`);
+    updateSettings({ ...settings, lastOpenedNoteId: fresh.id });
   };
 
-  // CUJ 3: Multi-Page PDF or .quire Bundle Import (with password-protected PDF support)
-  const handleImportFile = async (file: File) => {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    if (file.name.toLowerCase().endsWith('.quire')) {
-      try {
-        const { importQuireBundle } = await import('./engine/exportEngine');
-        const restored = await importQuireBundle(bytes);
-        setNotes((prev) => [restored, ...prev.filter((n) => n.id !== restored.id)]);
-        setActiveNoteId(restored.id);
-        setSidebarCollapsed(true);
-        showToast(`Restored "${restored.title}" from .quire archive`);
-      } catch (err) {
-        showToast(`Failed to import .quire: ${(err as Error).message}`);
-      }
-      return;
-    }
-
-    const tryLoadPdf = async (password?: string) => {
-      const result = await pdfEngine.importPdfBytes(bytes, file.name, password);
+  const finalizePdfImport = useCallback(
+    async (bytes: Uint8Array, fileName: string, password?: string) => {
+      const result = await pdfEngine.importPdfBytes(bytes, fileName, password);
       const targetFolder = filter.kind === 'folder' ? filter.folderId : null;
-      const baseTitle = file.name.replace(/\.pdf$/i, '');
+      const baseTitle = fileName.replace(/\.pdf$/i, '');
       const now = Date.now();
       const strokesByPage: NoteDocument['strokesByPage'] = {};
       const textBoxesByPage: NoteDocument['textBoxesByPage'] = {};
@@ -243,7 +606,7 @@ export function App() {
         folderId: targetFolder,
         tags: ['pdf'],
         isFavorite: false,
-        scrollDirection: settings.defaultScrollDirection,
+        scrollDirection: settingsRef.current.defaultScrollDirection,
         createdAt: now,
         updatedAt: now,
         deletedAt: null,
@@ -254,32 +617,83 @@ export function App() {
         audioSessions: [],
         hlc: { ts: now, counter: 0, deviceId: 'local' },
       };
-      persistNote(pdfNote, true);
+      persistNote(pdfNote, undefined, true);
       setActiveNoteId(pdfNote.id);
+      setActiveNote(pdfNote);
       setSidebarCollapsed(true);
-      showToast(`Imported ${result.pageCount}-page PDF "${baseTitle}"`);
-    };
+      window.history.pushState({ noteId: pdfNote.id }, '', `#/note/${pdfNote.id}`);
+      showToast(
+        `Imported ${result.pageCount}-page PDF "${baseTitle}"${
+          result.wasEncryptedUnlocked ? ' (unlocked locally)' : ''
+        }`
+      );
+      void refreshStorageHealth();
+    },
+    [filter, persistNote, showToast, refreshStorageHealth]
+  );
 
-    try {
-      await tryLoadPdf();
-    } catch (err) {
-      const msg = (err as Error).message ?? '';
-      if (msg.toLowerCase().includes('password')) {
-        const pw = window.prompt('This PDF is password-protected. Enter password:');
-        if (pw !== null) {
-          try {
-            await tryLoadPdf(pw);
-          } catch {
-            showToast('Incorrect PDF password.');
+  const handleImportFile = useCallback(
+    async (file: File) => {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (file.name.toLowerCase().endsWith('.quire')) {
+        try {
+          const { importQuireArchive } = await import('./engine/exportEngine');
+          const summary = await importQuireArchive(bytes);
+          const [loadedSummaries, loadedFolders] = await Promise.all([
+            quireStorage.loadNoteSummaries(),
+            quireStorage.loadAllFolders(),
+          ]);
+          setNoteSummaries(loadedSummaries);
+          setFolders(loadedFolders);
+          const first = summary.importedNotes[0];
+          if (summary.kind === 'single-note' && first) {
+            setActiveNoteId(first.id);
+            setActiveNote(first);
+            setSidebarCollapsed(true);
           }
+          const conflictMsg =
+            summary.conflictCopies.length > 0
+              ? ` (${summary.conflictCopies.length} conflict ${
+                  summary.conflictCopies.length === 1 ? 'copy' : 'copies'
+                } preserved)`
+              : '';
+          showToast(
+            summary.kind === 'full-library'
+              ? `Restored ${summary.importedNotes.length} notes & ${summary.importedFolders.length} folders${conflictMsg}`
+              : `Restored "${first?.title ?? 'Note'}"${conflictMsg}`
+          );
+          void refreshStorageHealth();
+        } catch (err) {
+          logDiagnostic('error', 'import', 'Failed to import .quire archive', err);
+          showToast(`Failed to import .quire: ${(err as Error).message}`);
         }
-      } else {
-        showToast(`Could not open PDF: ${msg}`);
+        return;
       }
-    }
-  };
 
-  // Folder CRUD (FR-ORG-02)
+      try {
+        await finalizePdfImport(bytes, file.name);
+      } catch (err) {
+        const msg = (err as Error).message ?? '';
+        if (msg.toLowerCase().includes('password')) {
+          setPasswordPrompt({ file, bytes, errorMessage: null });
+        } else {
+          logDiagnostic('error', 'import', `Failed to open PDF ${file.name}`, err);
+          showToast(`Could not open PDF: ${msg}`);
+        }
+      }
+    },
+    [finalizePdfImport, showToast, refreshStorageHealth]
+  );
+
+  // Attach OS `launchQueue` (`file_handlers`) & SW `POST ?share-target=1` handlers once hydrated
+  useEffect(() => {
+    if (!hydrated) return;
+    attachOsFileHandlers((file) => {
+      void handleImportFile(file);
+    });
+  }, [hydrated, handleImportFile]);
+
+  // Folder CRUD (FR-ORG-02) with recursive subfolder deletion
   const handleCreateFolder = (name: string, parentId: string | null, color: string) => {
     const folder: Folder = {
       id: createId('fld'),
@@ -294,18 +708,42 @@ export function App() {
     showToast(`Created folder "${name}"`);
   };
 
+  const handleRenameFolder = (folderId: string, newName: string) => {
+    const target = folders.find((f) => f.id === folderId);
+    if (!target) return;
+    const updated = { ...target, name: newName };
+    setFolders((prev) => prev.map((f) => (f.id === folderId ? updated : f)));
+    void quireStorage.saveFolder(updated);
+    showToast(`Renamed folder to "${newName}"`);
+  };
+
   const handleDeleteFolder = (folderId: string) => {
-    const folderNotes = activeNotes.filter((n) => n.folderId === folderId);
-    const now = Date.now();
-    folderNotes.forEach((n) => persistNote({ ...n, deletedAt: now }));
-    setFolders((prev) => prev.filter((f) => f.id !== folderId));
-    void quireStorage.deleteFolder(folderId);
-    if (filter.kind === 'folder' && filter.folderId === folderId) {
-      setFilter({ kind: 'all' });
-    }
-    showToast(
-      `Deleted folder (${folderNotes.length} note${folderNotes.length === 1 ? '' : 's'} moved to Recently Deleted)`
-    );
+    const target = folders.find((f) => f.id === folderId);
+    if (!target) return;
+    const allIds = new Set(getDescendantFolderIds(folderId, folders));
+    const affectedNotes = activeNotes.filter((n) => n.folderId && allIds.has(n.folderId));
+    const subCount = allIds.size - 1;
+
+    setConfirmDialog({
+      title: `Delete folder "${target.name}"?`,
+      message: `This will remove ${
+        subCount > 0 ? `this folder, ${subCount} subfolder${subCount === 1 ? '' : 's'}, ` : 'this folder '
+      }and move ${affectedNotes.length} note${affectedNotes.length === 1 ? '' : 's'} to Recently Deleted (30-day retention).`,
+      confirmLabel: 'Delete Folder',
+      onConfirm: () => {
+        const now = Date.now();
+        affectedNotes.forEach((n) => persistSummaryOnly({ ...n, deletedAt: now }));
+        setFolders((prev) => prev.filter((f) => !allIds.has(f.id)));
+        allIds.forEach((fid) => void quireStorage.deleteFolder(fid));
+        if (filter.kind === 'folder' && allIds.has(filter.folderId)) {
+          setFilter({ kind: 'all' });
+        }
+        setConfirmDialog(null);
+        showToast(
+          `Deleted folder (${affectedNotes.length} note${affectedNotes.length === 1 ? '' : 's'} moved to Recently Deleted)`
+        );
+      },
+    });
   };
 
   // Page Manager actions (FR-PDF-04, FR-INK-07)
@@ -320,14 +758,18 @@ export function App() {
     const newPage = createBlankPage(template, theme, generateOrderKey(prevKey, nextKey));
     const nextPages = [...activeNote.pages];
     nextPages.splice(index + 1, 0, newPage);
-    persistNote({
-      ...activeNote,
-      updatedAt: Date.now(),
-      pages: nextPages,
-      strokesByPage: { ...activeNote.strokesByPage, [newPage.pageId]: [] },
-      textBoxesByPage: { ...activeNote.textBoxesByPage, [newPage.pageId]: [] },
-      imagesByPage: { ...activeNote.imagesByPage, [newPage.pageId]: [] },
-    });
+    persistNote(
+      {
+        ...activeNote,
+        updatedAt: Date.now(),
+        pages: nextPages,
+        strokesByPage: { ...activeNote.strokesByPage, [newPage.pageId]: [] },
+        textBoxesByPage: { ...activeNote.textBoxesByPage, [newPage.pageId]: [] },
+        imagesByPage: { ...activeNote.imagesByPage, [newPage.pageId]: [] },
+      },
+      [newPage.pageId],
+      true
+    );
     showToast(`Inserted ${template} page after Page ${index + 1}`);
   };
 
@@ -343,35 +785,39 @@ export function App() {
     };
     const nextPages = [...activeNote.pages];
     nextPages.splice(index + 1, 0, copyPage);
-    persistNote({
-      ...activeNote,
-      updatedAt: Date.now(),
-      pages: nextPages,
-      strokesByPage: {
-        ...activeNote.strokesByPage,
-        [copyId]: structuredClone(activeNote.strokesByPage[src.pageId] ?? []).map((s) => ({
-          ...s,
-          id: createId('str'),
-          pageId: copyId,
-        })),
+    persistNote(
+      {
+        ...activeNote,
+        updatedAt: Date.now(),
+        pages: nextPages,
+        strokesByPage: {
+          ...activeNote.strokesByPage,
+          [copyId]: structuredClone(activeNote.strokesByPage[src.pageId] ?? []).map((s) => ({
+            ...s,
+            id: createId('str'),
+            pageId: copyId,
+          })),
+        },
+        textBoxesByPage: {
+          ...activeNote.textBoxesByPage,
+          [copyId]: structuredClone(activeNote.textBoxesByPage[src.pageId] ?? []).map((b) => ({
+            ...b,
+            id: createId('txt'),
+            pageId: copyId,
+          })),
+        },
+        imagesByPage: {
+          ...activeNote.imagesByPage,
+          [copyId]: structuredClone(activeNote.imagesByPage[src.pageId] ?? []).map((i) => ({
+            ...i,
+            id: createId('img'),
+            pageId: copyId,
+          })),
+        },
       },
-      textBoxesByPage: {
-        ...activeNote.textBoxesByPage,
-        [copyId]: structuredClone(activeNote.textBoxesByPage[src.pageId] ?? []).map((b) => ({
-          ...b,
-          id: createId('txt'),
-          pageId: copyId,
-        })),
-      },
-      imagesByPage: {
-        ...activeNote.imagesByPage,
-        [copyId]: structuredClone(activeNote.imagesByPage[src.pageId] ?? []).map((i) => ({
-          ...i,
-          id: createId('img'),
-          pageId: copyId,
-        })),
-      },
-    });
+      [copyId],
+      true
+    );
   };
 
   const handleMovePage = (fromIndex: number, toIndex: number) => {
@@ -379,13 +825,23 @@ export function App() {
     const nextPages = [...activeNote.pages];
     const [moved] = nextPages.splice(fromIndex, 1);
     nextPages.splice(toIndex, 0, moved);
-    persistNote({ ...activeNote, updatedAt: Date.now(), pages: nextPages });
+    persistNote({ ...activeNote, updatedAt: Date.now(), pages: nextPages }, undefined, true);
   };
 
   const handleDeletePage = (index: number) => {
     if (!activeNote || activeNote.pages.length <= 1) return;
-    const nextPages = activeNote.pages.filter((_, i) => i !== index);
-    persistNote({ ...activeNote, updatedAt: Date.now(), pages: nextPages });
+    setConfirmDialog({
+      title: `Delete Page ${index + 1}?`,
+      message: 'This removes the page and any ink or text boxes drawn on it.',
+      confirmLabel: 'Delete Page',
+      onConfirm: () => {
+        const cur = activeNoteRef.current;
+        if (!cur || cur.pages.length <= 1) return;
+        const nextPages = cur.pages.filter((_, i) => i !== index);
+        persistNote({ ...cur, updatedAt: Date.now(), pages: nextPages }, undefined, true);
+        setConfirmDialog(null);
+      },
+    });
   };
 
   const handleChangePageTemplate = (
@@ -403,7 +859,7 @@ export function App() {
         source: { kind: 'template' as const, template, theme },
       };
     });
-    persistNote({ ...activeNote, updatedAt: Date.now(), pages: nextPages });
+    persistNote({ ...activeNote, updatedAt: Date.now(), pages: nextPages }, undefined, true);
     showToast(
       applyToAll
         ? `Applied ${template} template to all template pages`
@@ -411,11 +867,81 @@ export function App() {
     );
   };
 
-  // Filtered & sorted library notes (FR-ORG-02..04)
+  // Full-Library Backup / Restore & Chromium local-folder auto-backup
+  const handleExportFullBackup = async (preferShare: boolean) => {
+    try {
+      flushPendingSaves();
+      const {
+        exportFullLibraryBackup,
+        shareOrDownloadFile,
+        writeBytesToDirectoryHandle,
+      } = await import('./engine/exportEngine');
+      const bytes = await exportFullLibraryBackup();
+      const stamp = new Date().toISOString().slice(0, 10);
+      const fileName = `Quire_Library_Backup_${stamp}.quire`;
+
+      if (localBackupDirRef.current && !preferShare) {
+        try {
+          await writeBytesToDirectoryHandle(localBackupDirRef.current, fileName, bytes);
+          updateSettings({
+            ...settingsRef.current,
+            backup: { ...settingsRef.current.backup, lastBackupAt: Date.now() },
+          });
+          showToast(`Saved full backup to ${settingsRef.current.backup.localFolderName}/${fileName}`);
+          return;
+        } catch {
+          // Fall back to regular download if permission expired
+        }
+      }
+
+      await shareOrDownloadFile(bytes, fileName, 'application/zip', preferShare);
+      updateSettings({
+        ...settingsRef.current,
+        backup: { ...settingsRef.current.backup, lastBackupAt: Date.now() },
+      });
+      showToast(`Exported Full-Library Backup (${(bytes.byteLength / 1024).toFixed(1)} KB)`);
+    } catch (err) {
+      logDiagnostic('error', 'backup', 'Full-library backup failed', err);
+      showToast(`Backup failed: ${(err as Error).message}`);
+    }
+  };
+
+  const handlePickLocalBackupFolder = async () => {
+    try {
+      const picker = (
+        window as Window & { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> }
+      ).showDirectoryPicker;
+      if (!picker) return;
+      const handle = await picker();
+      localBackupDirRef.current = handle;
+      updateSettings({
+        ...settingsRef.current,
+        backup: {
+          ...settingsRef.current.backup,
+          localFolderName: handle.name,
+          autoBackupLocalFolder: true,
+        },
+      });
+      showToast(`Local backup folder set to "${handle.name}"`);
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        showToast(`Could not select folder: ${(err as Error).message}`);
+      }
+    }
+  };
+
+  const backupOverdue = useMemo(() => {
+    const days = settings.backup.reminderIntervalDays;
+    if (!days || activeNotes.length === 0) return false;
+    const last = settings.backup.lastBackupAt;
+    if (!last) return activeNotes.length >= 3;
+    return Date.now() - last > days * 24 * 60 * 60 * 1000;
+  }, [settings.backup.reminderIntervalDays, settings.backup.lastBackupAt, activeNotes.length]);
+
   const visibleLibraryNotes = useMemo(() => {
-    let base: NoteDocument[];
+    let base: NoteSummary[];
     if (filter.kind === 'trash') {
-      base = notes.filter((n) => !!n.deletedAt);
+      base = noteSummaries.filter((n) => !!n.deletedAt);
     } else {
       base = activeNotes;
       if (filter.kind === 'favorites') {
@@ -427,13 +953,17 @@ export function App() {
       }
     }
 
-    const searched = searchNotes(base, folders, searchQuery);
+    const searched =
+      searchQuery.trim() && ftsMatchedIds
+        ? base.filter((n) => ftsMatchedIds.has(n.id))
+        : searchNotes(base, folders, searchQuery);
+
     const sorted = [...searched].sort((a, b) => {
       if (sortKey === 'title') return a.title.localeCompare(b.title);
       return b[sortKey] - a[sortKey];
     });
     return filter.kind === 'recents' ? sorted.slice(0, 12) : sorted;
-  }, [notes, activeNotes, folders, filter, searchQuery, sortKey]);
+  }, [noteSummaries, activeNotes, folders, filter, searchQuery, ftsMatchedIds, sortKey]);
 
   const filterTitle = useMemo(() => {
     switch (filter.kind) {
@@ -452,64 +982,10 @@ export function App() {
     }
   }, [filter, folders]);
 
-  // Conflict copy verification (CUJ 6)
-  const handleSimulateConflictSync = () => {
-    const target = activeNote ?? activeNotes[0];
-    if (!target) {
-      showToast('Create a note first to verify conflict copy behavior.');
-      return;
-    }
-    const pageId = target.pages[0].pageId;
-    const remoteSimulated: NoteDocument = {
-      ...structuredClone(target),
-      updatedAt: Date.now() + 1000,
-      hlc: { ts: target.hlc.ts + 1000, counter: 1, deviceId: 'dev_ipad_pro' },
-      strokesByPage: {
-        ...target.strokesByPage,
-        [pageId]: [
-          ...(target.strokesByPage[pageId] ?? []),
-          {
-            id: createId('str_remote'),
-            pageId,
-            tool: 'pen',
-            color: '#1d4ed8',
-            width: 3,
-            points: [
-              { x: 100, y: 120, pressure: 0.6, altitude: 1.2, azimuth: 0, dtMs: 0 },
-              { x: 240, y: 120, pressure: 0.6, altitude: 1.2, azimuth: 0, dtMs: 120 },
-            ],
-            bbox: { minX: 96, minY: 116, maxX: 244, maxY: 124 },
-          },
-        ],
-      },
-    };
-    const localWithEdit: NoteDocument = {
-      ...target,
-      strokesByPage: {
-        ...target.strokesByPage,
-        [pageId]: [
-          ...(target.strokesByPage[pageId] ?? []),
-          {
-            id: createId('str_local'),
-            pageId,
-            tool: 'pen',
-            color: '#c85a32',
-            width: 3,
-            points: [
-              { x: 100, y: 160, pressure: 0.6, altitude: 1.2, azimuth: 0, dtMs: 0 },
-              { x: 240, y: 160, pressure: 0.6, altitude: 1.2, azimuth: 0, dtMs: 120 },
-            ],
-            bbox: { minX: 96, minY: 156, maxX: 244, maxY: 164 },
-          },
-        ],
-      },
-    };
-    const { conflictCopy } = mergeNoteVersions(localWithEdit, remoteSimulated);
-    if (conflictCopy) {
-      persistNote(conflictCopy, true);
-      showToast(`Preserved offline edit as "${conflictCopy.title}"`);
-    }
-  };
+  const recordingNoteTitle = useMemo(
+    () => noteSummaries.find((n) => n.id === recordingNoteId)?.title ?? 'Note',
+    [noteSummaries, recordingNoteId]
+  );
 
   if (!hydrated) {
     return (
@@ -536,7 +1012,7 @@ export function App() {
 
       <LibrarySidebar
         collapsed={sidebarCollapsed}
-        notes={notes}
+        notes={noteSummaries}
         folders={folders}
         filter={filter}
         searchQuery={searchQuery}
@@ -550,25 +1026,91 @@ export function App() {
         }}
         onSearchChange={setSearchQuery}
         onSelectFilter={(f) => {
-          flushPendingSaves();
           setFilter(f);
-          setActiveNoteId(null);
+          void openNoteById(null);
         }}
         onNewNote={handleCreateNote}
         onTriggerPdfImport={() => pdfInputRef.current?.click()}
         onCreateFolder={handleCreateFolder}
+        onRenameFolder={handleRenameFolder}
         onDeleteFolder={handleDeleteFolder}
         onMoveNoteToFolder={(noteId, folderId) => {
-          const target = notes.find((n) => n.id === noteId);
+          const target = noteSummariesRef.current.find((n) => n.id === noteId);
           if (target) {
-            persistNote({ ...target, folderId, updatedAt: Date.now() }, true);
-            showToast('Moved note to folder');
+            persistSummaryOnly({ ...target, folderId, updatedAt: Date.now() });
+            showToast(folderId ? 'Moved note to folder' : 'Moved note to All Notes');
           }
         }}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => {
+          void refreshStorageHealth();
+          setSettingsOpen(true);
+        }}
       />
 
       <main class="main-column">
+        {storageHealth?.privateModeWarning && (
+          <div
+            role="status"
+            style={{
+              padding: '7px 14px',
+              background: 'rgba(200, 90, 50, 0.14)',
+              borderBottom: '1px solid var(--border-subtle)',
+              fontSize: '12px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '8px',
+            }}
+          >
+            <span>
+              <strong>Private Browsing detected:</strong> Browser storage may be cleared on exit.
+              Export a <code>.quire</code> backup before closing.
+            </span>
+            <button
+              type="button"
+              class="btn-secondary"
+              style={{ padding: '3px 8px', fontSize: '11.5px' }}
+              onClick={() => void handleExportFullBackup(false)}
+            >
+              Export Backup
+            </button>
+          </div>
+        )}
+
+        {pwaUpdate && (
+          <div
+            role="status"
+            style={{
+              padding: '7px 14px',
+              background: 'var(--surface-2)',
+              borderBottom: '1px solid var(--border-subtle)',
+              fontSize: '12.5px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '8px',
+            }}
+          >
+            <span>A new version of Quire is ready offline.</span>
+            <button
+              id="btn-apply-pwa-update"
+              type="button"
+              class="btn-primary"
+              style={{ padding: '4px 10px', fontSize: '12px' }}
+              onClick={() => {
+                if (recordingState !== 'idle') {
+                  showToast('Stop audio recording before updating Quire.');
+                  return;
+                }
+                flushPendingSaves();
+                pwaUpdate.applyUpdate();
+              }}
+            >
+              Update Now
+            </button>
+          </div>
+        )}
+
         {activeNote ? (
           <NoteEditor
             key={activeNote.id}
@@ -576,13 +1118,16 @@ export function App() {
             settings={settings}
             resolvedTheme={resolvedTheme}
             sidebarCollapsed={sidebarCollapsed}
+            recordingState={recordingState}
+            recordingNoteId={recordingNoteId}
+            recordingSessionId={recordingSessionId}
+            recordingElapsedMs={recordingElapsedMs}
+            getRecordingElapsedMs={() => audioRecorderRef.current?.getElapsedMs() ?? 0}
+            onToggleRecording={handleToggleRecording}
+            onStopRecording={handleStopRecording}
             onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
-            onBackToLibrary={() => {
-              flushPendingSaves();
-              setActiveNoteId(null);
-              setSidebarCollapsed(false);
-            }}
-            onUpdateNote={persistNote}
+            onBackToLibrary={() => void openNoteById(null)}
+            onUpdateNote={(updated, dirtyPageIds) => persistNote(updated, dirtyPageIds)}
             onUpdateSettings={updateSettings}
             onOpenPageManager={(idx) => setPageManagerPageIdx(idx)}
             onOpenExport={(idx) => setExportPageIdx(idx)}
@@ -606,6 +1151,16 @@ export function App() {
               </div>
 
               <div class="library-controls">
+                {backupOverdue && (
+                  <button
+                    type="button"
+                    class="btn-secondary"
+                    style={{ padding: '5px 9px', fontSize: '12px' }}
+                    onClick={() => void handleExportFullBackup(false)}
+                  >
+                    Backup Recommended
+                  </button>
+                )}
                 <select
                   aria-label="Sort notes"
                   value={sortKey}
@@ -640,7 +1195,7 @@ export function App() {
                   <h2>{searchQuery ? 'No matching notes' : 'Ready to capture'}</h2>
                   <p>
                     {searchQuery
-                      ? 'No notes matched your query across titles, folders, tags, or typed text. (Handwriting OCR search is planned for V1.5.)'
+                      ? 'No notes matched your query across titles, folders, tags, or typed text.'
                       : 'Create a fresh handwritten note in one tap or import a multi-page PDF slide deck.'}
                   </p>
                   {!searchQuery && filter.kind !== 'trash' && (
@@ -653,6 +1208,7 @@ export function App() {
                 <div class={viewMode === 'grid' ? 'notes-grid' : 'notes-list'}>
                   {visibleLibraryNotes.map((n) => {
                     const firstPage = n.pages[0];
+                    const thumbUrl = firstPage ? thumbUrls[firstPage.pageId] : undefined;
                     const effectiveThumbTheme = firstPage
                       ? resolveEffectivePaperTheme(
                           firstPage.source,
@@ -665,7 +1221,7 @@ export function App() {
                         ? `paper-theme-${effectiveThumbTheme} paper-tpl-${firstPage.source.template}`
                         : `paper-theme-${effectiveThumbTheme}`;
                     const thumbBg =
-                      firstPage?.source.kind === 'template' && firstPage.source.template !== 'blank'
+                      !thumbUrl && firstPage?.source.kind === 'template' && firstPage.source.template !== 'blank'
                         ? getPaperTemplateSvgDataUri(
                             firstPage.source.template,
                             effectiveThumbTheme,
@@ -685,17 +1241,33 @@ export function App() {
                         }}
                         onClick={() => {
                           if (!isTrash) {
-                            setActiveNoteId(n.id);
-                            setSidebarCollapsed(true);
+                            void openNoteById(n.id);
                           }
                         }}
                       >
                         {viewMode === 'grid' && (
                           <div
                             class={`note-thumb ${thumbCls}`}
-                            style={thumbBg ? { backgroundImage: thumbBg } : undefined}
+                            style={{
+                              ...(thumbBg ? { backgroundImage: thumbBg } : {}),
+                              position: 'relative',
+                              overflow: 'hidden',
+                            }}
                           >
-                            <span class="note-thumb-badge">
+                            {thumbUrl && (
+                              <img
+                                src={thumbUrl}
+                                alt=""
+                                style={{
+                                  position: 'absolute',
+                                  inset: 0,
+                                  width: '100%',
+                                  height: '100%',
+                                  objectFit: 'cover',
+                                }}
+                              />
+                            )}
+                            <span class="note-thumb-badge" style={{ position: 'relative', zIndex: 1 }}>
                               {firstPage?.source.kind === 'pdf' ? 'PDF · ' : ''}
                               {n.pages.length} {n.pages.length === 1 ? 'page' : 'pages'}
                               {n.audioSessions.length > 0 ? ' · Audio' : ''}
@@ -723,7 +1295,7 @@ export function App() {
                                 class="btn-secondary"
                                 style={{ padding: '4px 8px', fontSize: '12px' }}
                                 onClick={() => {
-                                  persistNote({ ...n, deletedAt: null, updatedAt: Date.now() }, true);
+                                  persistSummaryOnly({ ...n, deletedAt: null, updatedAt: Date.now() });
                                   showToast(`Restored "${n.title}"`);
                                 }}
                               >
@@ -735,9 +1307,21 @@ export function App() {
                                 style={{ color: 'var(--danger)' }}
                                 aria-label={`Permanently delete ${n.title}`}
                                 onClick={() => {
-                                  cancelPendingSave(n.id);
-                                  setNotes((prev) => prev.filter((item) => item.id !== n.id));
-                                  void quireStorage.hardDeleteNote(n.id);
+                                  setConfirmDialog({
+                                    title: `Permanently delete "${n.title}"?`,
+                                    message:
+                                      'This note and any unreferenced PDF, image, or audio attachments will be permanently removed from local storage.',
+                                    confirmLabel: 'Delete Forever',
+                                    onConfirm: () => {
+                                      cancelPendingSave(n.id);
+                                      setNoteSummaries((prev) => prev.filter((item) => item.id !== n.id));
+                                      void quireStorage.hardDeleteNote(n.id).then(() => {
+                                        void refreshStorageHealth();
+                                      });
+                                      setConfirmDialog(null);
+                                      showToast(`Permanently deleted "${n.title}"`);
+                                    },
+                                  });
                                 }}
                               >
                                 <Trash2 size={15} />
@@ -745,11 +1329,56 @@ export function App() {
                             </>
                           ) : (
                             <>
+                              {folders.length > 0 && (
+                                <button
+                                  type="button"
+                                  class="btn-icon"
+                                  title="Move to Folder"
+                                  aria-label={`Move ${n.title} to folder`}
+                                  onClick={() =>
+                                    setMoveMenuNoteId((prev) => (prev === n.id ? null : n.id))
+                                  }
+                                >
+                                  <FolderInput size={15} />
+                                </button>
+                              )}
+                              {moveMenuNoteId === n.id && (
+                                <select
+                                  aria-label={`Choose folder for ${n.title}`}
+                                  value={n.folderId ?? ''}
+                                  onChange={(e) => {
+                                    const fid = (e.target as HTMLSelectElement).value || null;
+                                    persistSummaryOnly({
+                                      ...n,
+                                      folderId: fid,
+                                      updatedAt: Date.now(),
+                                    });
+                                    setMoveMenuNoteId(null);
+                                    showToast(fid ? 'Moved note to folder' : 'Moved note to All Notes');
+                                  }}
+                                  style={{
+                                    padding: '3px 6px',
+                                    borderRadius: '6px',
+                                    border: '1px solid var(--border-strong)',
+                                    background: 'var(--surface-1)',
+                                    fontSize: '11.5px',
+                                  }}
+                                >
+                                  <option value="">All Notes (Root)</option>
+                                  {folders
+                                    .filter((f) => !f.deletedAt)
+                                    .map((f) => (
+                                      <option key={f.id} value={f.id}>
+                                        {f.name}
+                                      </option>
+                                    ))}
+                                </select>
+                              )}
                               <button
                                 type="button"
                                 class={`btn-icon ${n.isFavorite ? 'active' : ''}`}
                                 aria-label={`Favorite ${n.title}`}
-                                onClick={() => persistNote({ ...n, isFavorite: !n.isFavorite }, true)}
+                                onClick={() => persistSummaryOnly({ ...n, isFavorite: !n.isFavorite })}
                               >
                                 <Star size={15} fill={n.isFavorite ? 'currentColor' : 'none'} />
                               </button>
@@ -758,7 +1387,7 @@ export function App() {
                                 class="btn-icon"
                                 aria-label={`Move ${n.title} to Trash`}
                                 onClick={() => {
-                                  persistNote({ ...n, deletedAt: Date.now() }, true);
+                                  persistSummaryOnly({ ...n, deletedAt: Date.now() });
                                   showToast(`Moved "${n.title}" to Recently Deleted`);
                                 }}
                               >
@@ -776,6 +1405,59 @@ export function App() {
           </div>
         )}
       </main>
+
+      {/* Persistent App-Level Recording Mini-Bar (when recording on another note or in Library) */}
+      {recordingState !== 'idle' && recordingNoteId && recordingNoteId !== activeNoteId && (
+        <div
+          id="floating-recording-bar"
+          class="audio-bar"
+          role="region"
+          aria-label="Active Background Recording"
+          style={{ bottom: '18px', zIndex: 60 }}
+        >
+          <span class="rec-dot" />
+          <strong style={{ fontFamily: 'var(--font-mono)', fontSize: '12.5px' }}>
+            {formatDuration(recordingElapsedMs)}
+          </strong>
+          <button
+            type="button"
+            class="btn-secondary"
+            style={{ padding: '4px 8px', fontSize: '12px' }}
+            onClick={() => void openNoteById(recordingNoteId)}
+          >
+            Return to {recordingNoteTitle}
+          </button>
+          <button
+            type="button"
+            class="btn-primary"
+            style={{ padding: '4px 9px', fontSize: '12px' }}
+            onClick={() => void handleStopRecording()}
+          >
+            <Square size={12} /> Stop
+          </button>
+        </div>
+      )}
+
+      {/* Single-Active-Window OPFS Lock Overlay */}
+      {pausedByOtherTab && (
+        <div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Paused in another tab">
+          <div class="modal-sheet" style={{ maxWidth: '400px', textAlign: 'center' }}>
+            <h2 style={{ margin: 0 }}>Quire is open in another tab</h2>
+            <p style={{ margin: 0, fontSize: '13.5px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+              To protect your local SQLite &amp; OPFS storage from concurrent writes, this tab has
+              paused cleanly.
+            </p>
+            <button
+              id="btn-resume-tab-lock"
+              type="button"
+              class="btn-primary"
+              onClick={() => void lockCoordinatorRef.current?.claimOwnership()}
+            >
+              Resume Here
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Modals & Sheets */}
       {!settings.hasCompletedOnboarding && (
@@ -808,18 +1490,40 @@ export function App() {
       {settingsOpen && (
         <SettingsModal
           settings={settings}
+          storageHealth={storageHealth}
           onUpdateSettings={updateSettings}
-          onSimulateConflictSync={handleSimulateConflictSync}
-          onTriggerBackupNow={() => {
-            updateSettings({
-              ...settings,
-              backup: { ...settings.backup, status: 'synced', lastBackupAt: Date.now() },
-            });
-            showToast(
-              `Backed up ${activeNotes.length} notes (${settings.backup.format.toUpperCase()}) to ${settings.backup.provider}`
-            );
-          }}
+          onExportFullBackup={handleExportFullBackup}
+          onImportFullBackup={handleImportFile}
+          onPickLocalBackupFolder={handlePickLocalBackupFolder}
           onClose={() => setSettingsOpen(false)}
+        />
+      )}
+
+      {passwordPrompt && (
+        <PasswordModal
+          fileName={passwordPrompt.file.name}
+          errorMessage={passwordPrompt.errorMessage}
+          onCancel={() => setPasswordPrompt(null)}
+          onSubmit={async (pw) => {
+            try {
+              await finalizePdfImport(passwordPrompt.bytes, passwordPrompt.file.name, pw);
+              setPasswordPrompt(null);
+            } catch {
+              setPasswordPrompt((prev) =>
+                prev ? { ...prev, errorMessage: 'Incorrect PDF password. Please try again.' } : null
+              );
+            }
+          }}
+        />
+      )}
+
+      {confirmDialog && (
+        <ConfirmModal
+          title={confirmDialog.title}
+          message={confirmDialog.message}
+          confirmLabel={confirmDialog.confirmLabel}
+          onConfirm={confirmDialog.onConfirm}
+          onCancel={() => setConfirmDialog(null)}
         />
       )}
 

@@ -12,9 +12,9 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Typecheck, Build, Unit & E2E Tests
+    name: Lint, Typecheck, Build (/quire/), Unit & Chromium/WebKit E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -29,10 +29,15 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Lint (oxlint)
+        run: npm run lint
+
       - name: Run unit tests (Vitest)
         run: npm test
 
-      - name: Typecheck & production build
+      - name: Typecheck & production build (/quire/ subpath)
+        env:
+          VITE_BASE_PATH: /quire/
         run: npm run build
 
       - name: Setup Python for Playwright E2E
@@ -40,14 +45,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Playwright & Chromium
+      - name: Install Playwright (Chromium & WebKit)
         run: |
           python3 -m pip install --upgrade pip playwright
-          python3 -m playwright install --with-deps chromium
+          python3 -m playwright install --with-deps chromium webkit
 
-      - name: Run Playwright E2E validation (CUJ 1–7)
+      - name: Run Playwright E2E validation (Chromium + WebKit @ /quire/)
         env:
           E2E_OUTPUT_DIR: ${{ runner.temp }}/quire-e2e
+          E2E_BROWSER: all
+          E2E_BASE_PATH: /quire/
           PLAYWRIGHT_USE_BUNDLED: '1'
         run: python3 tests/e2e_validate.py
 
