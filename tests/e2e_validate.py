@@ -432,6 +432,11 @@ def run_suite_for_browser(browser_name: str, base_url: str, sample_pdf: Path, la
         # Verify Lasso select + tap-outside dismiss
         page.click("#tool-lasso")
         page.wait_for_selector("#tool-lasso.active", timeout=2000)
+        page.evaluate("""() => {
+            const sc = document.getElementById('stage-scroller');
+            if (sc) { sc.scrollTop = 0; sc.scrollLeft = 0; }
+        }""")
+        page.wait_for_timeout(60)
         slot_box_lasso = page.locator('.page-slot[data-page-index="0"]').bounding_box()
         assert slot_box_lasso is not None
         page.mouse.move(slot_box_lasso["x"] + 60, slot_box_lasso["y"] + 90)
